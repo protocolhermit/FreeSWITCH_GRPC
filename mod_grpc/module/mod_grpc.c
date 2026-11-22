@@ -24,6 +24,7 @@
 #include "conference_recording.h"
 #include "api_guard.h"
 #include "xml_fetch.h"
+#include "tenant.h"
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load);
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_grpc_shutdown);
@@ -71,6 +72,15 @@ static struct {
 	const char *xml_app_allow;
 	const char *var_allow;
 	const char *route_vars; /* extra channel variables sent on RouteRequest and StepResult; "" = none */
+	int reg_mode;                 /* TN_MODE_*: registration-mode */
+	int tenancy_single;           /* tenancy=single: every call gets default-tenant */
+	const char *default_tenant;
+	const char *tenant_header_acl; /* NULL: sip_h_X-Tenant-Id is trusted in edge mode */
+	switch_hash_t *domain_tenants; /* lowercased domain -> tenant UUID, from <domain-tenants> */
+	int directory_auth;           /* resolved after parsing: unset means on unless edge */
+	const char *peer_profile;
+	const char *sip_address;      /* host:port peers dial, sent in engine mode */
+	unsigned untrusted_headers;   /* state_mutex */
 	int nnodes;
 	switch_mutex_t *rec_mutex; /* job list only; never held across a conference API or HTTP call */
 	switch_queue_t *uploadq;
@@ -605,6 +615,65 @@ static switch_bool_t resolve_tenant(const char *domain, char *out, size_t outlen
 	return ok;
 }
 
+static int tn_engine_cb(void *ud, const char *domain, char *out, size_t outlen)
+{
+	(void) ud;
+	return resolve_tenant(domain, out, outlen) ? 1 : 0;
+}
+
+static int tn_map_cb(void *ud, const char *domain, char *out, size_t outlen)
+{
+	const char *t = globals.domain_tenants ? (const char *) switch_core_hash_find(globals.domain_tenants, domain) : NULL;
+	(void) ud;
+	if (zstr(t) || strlen(t) >= outlen) return 0;
+	strcpy(out, t);
+	return 1;
+}
+
+/* The tenant of a call (channel) or of a directory lookup (channel NULL: no header, no variable). Returns TN_SRC_*.
+ * out must hold at least 64 bytes. An X-Tenant-Id the ACL does not vouch for is removed from the channel and counted. */
+static int tenant_for(switch_channel_t *channel, const char *domain, char *out, size_t outlen)
+{
+	tn_config_t cfg;
+	tn_input_t in;
+	char ip[64] = "";
+	int acl_set = !zstr(globals.tenant_header_acl), acl_pass = 0, src;
+	const char *hv, *v;
+
+	memset(&cfg, 0, sizeof cfg);
+	memset(&in, 0, sizeof in);
+	cfg.mode = globals.reg_mode;
+	cfg.single = globals.tenancy_single;
+	cfg.default_tenant = globals.default_tenant;
+	cfg.map = tn_map_cb;
+	cfg.engine = tn_engine_cb;
+	in.domain = domain;
+	if (channel) {
+		hv = switch_channel_get_variable(channel, "sip_h_X-Tenant-Id");
+		in.header = hv ? strdup(hv) : NULL; /* freed below: a later set on the channel frees the original */
+		v = switch_channel_get_variable(channel, "tenant_id");
+		in.var = v ? strdup(v) : NULL;
+		if (acl_set) {
+			v = switch_channel_get_variable(channel, "network_addr");
+			if (v) switch_snprintf(ip, sizeof ip, "%s", v);
+			acl_pass = !zstr(ip) && switch_check_network_list_ip(ip, globals.tenant_header_acl) ? 1 : 0;
+		}
+		in.header_trusted = tn_header_trusted(globals.reg_mode, acl_set, acl_pass);
+	}
+	src = tn_resolve(&cfg, &in, out, outlen);
+	if (channel && !zstr(in.header) && !in.header_trusted) {
+		switch_channel_set_variable(channel, "sip_h_X-Tenant-Id", NULL);
+		switch_mutex_lock(globals.state_mutex);
+		globals.untrusted_headers++;
+		switch_mutex_unlock(globals.state_mutex);
+		switch_log_printf(SWITCH_CHANNEL_CHANNEL_LOG(channel), SWITCH_LOG_WARNING,
+						  "untrusted X-Tenant-Id from %s for domain %s ignored\n", zstr(ip) ? "?" : ip, zstr(domain) ? "-" : domain);
+	}
+	free((void *) in.header);
+	free((void *) in.var);
+	return src;
+}
+
 /* ------------------------------------------------------ directory binding */
 
 static void xml_escape(switch_stream_handle_t *s, const char *in)
@@ -638,7 +707,7 @@ static switch_xml_t directory_search(const char *section, const char *tag_name, 
 	if (zstr(domain) || zstr(user) || strlen(domain) + strlen(user) > 250) return NULL;
 	given = switch_event_get_header(params, "tenant_id");
 	if (!zstr(given) && strlen(given) < sizeof(tenant)) switch_snprintf(tenant, sizeof(tenant), "%s", given);
-	else if (!resolve_tenant(domain, tenant, sizeof(tenant))) return NULL;
+	else if (tenant_for(NULL, domain, tenant, sizeof(tenant)) == TN_SRC_NONE) return NULL;
 
 	switch_snprintf(lookup_key, sizeof(lookup_key), "%s@%s", user, domain);
 	if (gb_lookup(globals.bridge, tenant, GB_KIND_DIRECTORY, lookup_key, 1500, &r) != GB_OK) return NULL;
@@ -1705,11 +1774,15 @@ static switch_bool_t survival_route(switch_core_session_t *session)
 	const char *domain = first_var(channel, "domain_name", "sip_req_host");
 	const char *number = cp && cp->destination_number ? cp->destination_number : "";
 	gb_lookup_result_t r;
-	char dial[512];
+	char dial[512], resolved[64] = "";
 	int rc;
 
 	tenant = tenant ? switch_core_session_strdup(session, tenant) : NULL;
 	domain = domain ? switch_core_session_strdup(session, domain) : NULL;
+	/* edge: the header alone, as before. local/engine have no edge to stamp it, so the configured tenancy decides. */
+	if (globals.reg_mode != TN_MODE_EDGE) {
+		tenant = tenant_for(channel, domain, resolved, sizeof resolved) != TN_SRC_NONE ? switch_core_session_strdup(session, resolved) : NULL;
+	}
 	if (!dg_uuid_shaped(tenant) || zstr(domain)) return SWITCH_FALSE;
 	if (gb_survival_get(globals.bridge, tenant, &r) != GB_OK) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "survival: no usable snapshot for tenant %s\n", tenant);
@@ -1868,7 +1941,7 @@ SWITCH_STANDARD_APP(grpc_route_function)
 	switch_caller_profile_t *cp = switch_channel_get_caller_profile(channel);
 	const char *uuid = switch_core_session_get_uuid(session);
 	/* switch_channel_set_variable frees the old value, so every variable read that outlives a set must be copied first */
-	const char *tenant = first_var(channel, "sip_h_X-Tenant-Id", "tenant_id"); /* header set by Kamailio */
+	const char *tenant; /* from tenant_for: header set by Kamailio (edge), default-tenant, map or engine */
 	const char *call_id = first_var(channel, "call_id", NULL);
 	const char *domain = first_var(channel, "domain_name", "sip_req_host");
 	const char *vnames[] = { "sip_call_id", "network_addr", "sip_from_user", "sip_from_host", "xfer_token", "dialer_token", "grpc_api_rule", NULL };
@@ -1880,10 +1953,9 @@ SWITCH_STANDARD_APP(grpc_route_function)
 
 	char resolved[64] = "";
 
-	tenant = tenant ? switch_core_session_strdup(session, tenant) : NULL;
 	call_id = call_id ? switch_core_session_strdup(session, call_id) : NULL;
 	domain = domain ? switch_core_session_strdup(session, domain) : NULL;
-	if (zstr(tenant) && resolve_tenant(domain, resolved, sizeof(resolved))) tenant = switch_core_session_strdup(session, resolved);
+	tenant = tenant_for(channel, domain, resolved, sizeof(resolved)) != TN_SRC_NONE ? switch_core_session_strdup(session, resolved) : NULL;
 	if (zstr(call_id)) call_id = uuid;
 	switch_channel_set_variable(channel, "call_id", call_id);
 	if (!zstr(tenant)) switch_channel_set_variable(channel, "tenant_id", tenant);
@@ -1963,7 +2035,7 @@ static void undrain(void)
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "drain lifted: new inbound calls accepted\n");
 }
 
-#define GRPC_SYNTAX "status | undrain | lookup <tenant> <directory|dialplan|config> <key> | survival <tenant> | cache flush | xml"
+#define GRPC_SYNTAX "status | undrain | lookup <tenant> <directory|dialplan|config> <key> | survival <tenant> | tenant <domain> | cache flush | xml"
 
 SWITCH_STANDARD_API(grpc_api)
 {
@@ -1978,14 +2050,18 @@ SWITCH_STANDARD_API(grpc_api)
 	if (!strcasecmp(argv[0], "status")) {
 		gb_cache_stats_t st;
 		char reason[256];
+		unsigned untrusted;
 		gb_cache_stats(globals.bridge, &st);
 		switch_mutex_lock(globals.state_mutex);
+		untrusted = globals.untrusted_headers;
 		switch_snprintf(reason, sizeof(reason), "%s", globals.last_reason);
 		switch_mutex_unlock(globals.state_mutex);
-		stream->write_function(stream, "node=%s endpoints=%s connected=%s draining=%s cache_entries=%u hits=%u stale_served=%u invalidated=%u survival=%s last=\"%s\"\n",
+		stream->write_function(stream, "node=%s endpoints=%s connected=%s draining=%s cache_entries=%u hits=%u stale_served=%u invalidated=%u survival=%s last=\"%s\" mode=%s tenancy=%s untrusted_tenant_headers=%u\n",
 							   globals.node_id, globals.endpoints, gb_connected(globals.bridge) ? "yes" : "no",
 							   globals.draining ? "yes" : "no", (unsigned) st.entries, (unsigned) st.hits,
-							   (unsigned) st.stale_served, (unsigned) st.invalidated, globals.survival ? "on" : "off", reason);
+							   (unsigned) st.stale_served, (unsigned) st.invalidated, globals.survival ? "on" : "off", reason,
+							   globals.reg_mode == TN_MODE_LOCAL ? "local" : globals.reg_mode == TN_MODE_ENGINE ? "engine" : "edge",
+							   globals.tenancy_single ? "single" : "multi", untrusted);
 	} else if (!strcasecmp(argv[0], "undrain") && argc == 1) {
 		undrain();
 		stream->write_function(stream, "+OK\n");
@@ -2018,6 +2094,10 @@ SWITCH_STANDARD_API(grpc_api)
 		stream->write_function(stream, "sections=%s mode=%s served=%u rejected=%u last_reject=\"%s\" acl_reloads=%u acl_source=%s acl_fetch_failed=%u\n",
 							   zstr(globals.xml_sections_raw) ? "-" : globals.xml_sections_raw,
 							   globals.xf_mode == XF_FETCH_CONTEXT ? "context" : "call", served, rejected, last, reloads, source, failed);
+	} else if (!strcasecmp(argv[0], "tenant") && argc == 2) {
+		char t[64];
+		int src = tenant_for(NULL, argv[1], t, sizeof t);
+		stream->write_function(stream, "tenant=%s source=%s\n", src == TN_SRC_NONE ? "-" : t, tn_source_name(src));
 	} else if (!strcasecmp(argv[0], "survival") && argc == 2) {
 		gb_lookup_result_t r;
 		if (globals.survival && gb_survival_get(globals.bridge, argv[1], &r) == GB_OK) {
@@ -2301,10 +2381,13 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
 	gb_config_t c;
 	gb_callbacks_t cb;
 	char *file_token = NULL;
+	switch_xml_t dt, d;
+	int dt_bad = 0;
 	char version[64];
 	static const switch_event_types_t types[] = { SWITCH_EVENT_CHANNEL_CREATE, SWITCH_EVENT_CHANNEL_ANSWER, SWITCH_EVENT_DTMF,
 												  SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE };
-	int i, require_tls = 0;
+	int i, require_tls = 0, mode_ok = 1, tenancy_ok = 1, dir_auth_set = -1, peer_profile_ok = 1;
+	const char *bad_val = "";
 
 	memset(&globals, 0, sizeof(globals));
 	curl_global_init(CURL_GLOBAL_DEFAULT); /* reference counted; other modules may have called it */
@@ -2353,11 +2436,36 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
 				globals.xf_mode = xf_fetch_mode(val, &known);
 				if (!known) switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "xml-dialplan-fetch %s unknown, using call\n", val);
 			}
+			else if (!strcasecmp(var, "registration-mode")) {
+				if (!tn_parse_mode(val, &globals.reg_mode)) { mode_ok = 0; bad_val = switch_core_strdup(pool, val); }
+			} else if (!strcasecmp(var, "tenancy")) {
+				if (!strcasecmp(val, "single")) globals.tenancy_single = 1;
+				else if (strcasecmp(val, "multi")) tenancy_ok = 0;
+			}
+			else if (!strcasecmp(var, "default-tenant")) globals.default_tenant = switch_core_strdup(pool, val);
+			else if (!strcasecmp(var, "tenant-header-acl")) globals.tenant_header_acl = switch_core_strdup(pool, val);
+			else if (!strcasecmp(var, "directory-auth")) dir_auth_set = switch_true(val) ? 1 : 0;
+			else if (!strcasecmp(var, "peer-profile")) {
+				size_t k;
+				globals.peer_profile = switch_core_strdup(pool, val);
+				peer_profile_ok = !zstr(val);
+				for (k = 0; peer_profile_ok && val[k]; k++) if (!(isalnum((unsigned char) val[k]) || val[k] == '_' || val[k] == '-')) peer_profile_ok = 0;
+			}
+			else if (!strcasecmp(var, "sip-address")) globals.sip_address = switch_core_strdup(pool, val);
 			else if (!strcasecmp(var, "capacity")) c.capacity = atoi(val);
 			else if (!strcasecmp(var, "cache-max-entries")) c.cache_max_entries = atoi(val);
 			else if (!strcasecmp(var, "keepalive-ms")) c.keepalive_ms = atoi(val);
 			else if (!strcasecmp(var, "hello-timeout-ms")) c.hello_timeout_ms = atoi(val);
 			else switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "unknown mod_grpc setting %s\n", var);
+		}
+	}
+	switch_core_hash_init(&globals.domain_tenants); /* ponytail: never destroyed, like the bridge: in-flight lookups may still read it */
+	if ((dt = switch_xml_child(cfg, "domain-tenants"))) {
+		for (d = switch_xml_child(dt, "domain"); d; d = d->next) {
+			const char *name = switch_xml_attr_soft(d, "name"), *ten = switch_xml_attr_soft(d, "tenant");
+			char low[256];
+			if (!tn_lower_domain(name, low, sizeof low) || !dg_uuid_shaped(ten)) { dt_bad = 1; continue; }
+			switch_core_hash_insert(globals.domain_tenants, switch_core_strdup(pool, low), (void *) switch_core_strdup(pool, ten));
 		}
 	}
 	if (globals.token_file && (file_token = read_token_file(globals.token_file))) c.token = switch_core_strdup(pool, file_token);
@@ -2371,6 +2479,35 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_grpc needs engine-endpoints, node-id and password (or token-file)\n");
 		return SWITCH_STATUS_TERM;
 	}
+	if (!mode_ok) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_grpc: unknown registration-mode %s; refusing to load\n", bad_val);
+		return SWITCH_STATUS_TERM;
+	}
+	if (!tenancy_ok) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_grpc: tenancy must be single or multi; refusing to load\n");
+		return SWITCH_STATUS_TERM;
+	}
+	if (!tn_config_ok(globals.tenancy_single, globals.default_tenant)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_grpc: tenancy=single needs a UUID default-tenant; refusing to load\n");
+		return SWITCH_STATUS_TERM;
+	}
+	if (dt_bad) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_grpc: domain-tenants needs a name and a UUID tenant on every domain; refusing to load\n");
+		return SWITCH_STATUS_TERM;
+	}
+	if (!peer_profile_ok) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_grpc: peer-profile must match [A-Za-z0-9_-]+; refusing to load\n");
+		return SWITCH_STATUS_TERM;
+	}
+	if (globals.reg_mode == TN_MODE_ENGINE && zstr(globals.sip_address)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_grpc: registration-mode=engine needs sip-address (host:port peers dial); refusing to load\n");
+		return SWITCH_STATUS_TERM;
+	}
+	/* ponytail: FreeSWITCH cannot tell an unknown ACL from a denied address (both false), so an unknown list is only a warning */
+	if (!zstr(globals.tenant_header_acl) && !switch_check_network_list_ip("127.0.0.1", globals.tenant_header_acl))
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "mod_grpc: tenant-header-acl %s denies 127.0.0.1 or does not exist; if it does not exist no tenant header is trusted in local/engine mode\n", globals.tenant_header_acl);
+	if (zstr(globals.peer_profile)) globals.peer_profile = "internal";
+	globals.directory_auth = dir_auth_set >= 0 ? dir_auth_set : (globals.reg_mode != TN_MODE_EDGE);
 	if (!globals.api_allow) globals.api_allow = "uuid_setvar,uuid_transfer,uuid_broadcast,originate";
 	if (!globals.api_headers) globals.api_headers = "";
 	if (!globals.xml_app_allow) globals.xml_app_allow = "answer,set,export,playback,bridge,transfer,hangup,sleep";
