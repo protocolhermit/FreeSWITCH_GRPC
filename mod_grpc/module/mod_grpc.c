@@ -1991,12 +1991,10 @@ SWITCH_STANDARD_APP(grpc_route_function)
 	int rc;
 
 	char resolved[64] = "";
-	int tsrc;
 
 	call_id = call_id ? switch_core_session_strdup(session, call_id) : NULL;
 	domain = domain ? switch_core_session_strdup(session, domain) : NULL;
-	tsrc = tenant_for(channel, domain, resolved, sizeof(resolved));
-	tenant = tsrc != TN_SRC_NONE ? switch_core_session_strdup(session, resolved) : NULL;
+	tenant = tenant_for(channel, domain, resolved, sizeof(resolved)) != TN_SRC_NONE ? switch_core_session_strdup(session, resolved) : NULL;
 	if (zstr(tenant) && globals.reg_mode != TN_MODE_EDGE) { /* spec 5.2: no tenant outside edge means no call; edge sends tenant_id="" as before */
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "no tenant for domain %s: rejecting the call\n", zstr(domain) ? "-" : domain);
 		switch_channel_hangup(channel, SWITCH_CAUSE_NORMAL_TEMPORARY_FAILURE);
@@ -2023,7 +2021,10 @@ SWITCH_STANDARD_APP(grpc_route_function)
 		}
 		if (first) switch_channel_variable_last(channel);
 	}
-	if (tsrc == TN_SRC_HEADER && !zstr(switch_channel_get_variable(channel, "sip_h_X-Grpc-Hop"))) { /* a hop from a peer node: the engine must not hop it again */
+	/* a hop from a peer node: the engine must not hop it again. tenant_for already removed an untrusted X-Tenant-Id, so a
+	 * header still on the channel is trusted; the source tenant_for used (tenancy=single) does not matter. */
+	if (globals.reg_mode == TN_MODE_ENGINE && !zstr(switch_channel_get_variable(channel, "sip_h_X-Grpc-Hop")) &&
+		!zstr(switch_channel_get_variable(channel, "sip_h_X-Tenant-Id"))) {
 		vars[nv].key = "hop";
 		vars[nv].value = "1";
 		nv++;
@@ -2603,7 +2604,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
 	switch_snprintf(version, sizeof(version), "%s", switch_version_full());
 	c.version = version;
 	c.sip_address = globals.sip_address;
-	c.registration_mode = globals.reg_mode == TN_MODE_LOCAL ? "local" : globals.reg_mode == TN_MODE_ENGINE ? "engine" : "edge";
+	c.registration_mode = globals.reg_mode == TN_MODE_LOCAL ? "local" : globals.reg_mode == TN_MODE_ENGINE ? "engine" : NULL; /* edge: Hello unchanged */
 
 	cb.on_state = cb_state;
 	cb.on_command = cb_command;

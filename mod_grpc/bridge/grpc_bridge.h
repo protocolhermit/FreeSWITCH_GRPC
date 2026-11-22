@@ -84,7 +84,7 @@ typedef struct {
 	int survival_refresh_s;      /* 0 = survival cache off; else the periodic refetch interval */
 	int survival_max_age_s;      /* 0 = 86400: how long a fetched snapshot may be served with no engine */
 	const char *sip_address;       /* host:port of this node's SIP profile, may be NULL */
-	const char *registration_mode; /* "engine" or "local", may be NULL */
+	const char *registration_mode; /* "engine" or "local"; NULL in edge mode */
 } gb_config_t;
 
 typedef struct {
