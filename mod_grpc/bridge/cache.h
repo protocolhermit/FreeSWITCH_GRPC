@@ -1,0 +1,170 @@
+// In-process lookup cache: TTL, per-entry version, LRU cap. Header-only so the
+// unit test needs no gRPC. Thread-safe.
+#pragma once
+
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <list>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+namespace gb {
+
+class Cache {
+ public:
+  using Clock = std::chrono::steady_clock;
+  using Now = std::function<Clock::time_point()>;
+
+  struct Entry {
+    bool found = false;
+    int64_t version = 0;
+    std::string payload;
+    int32_t ttl_s = 0;
+    bool stale = false;  // filled by get() when served past expiry
+  };
+  struct Stats {
+    size_t entries = 0;
+    uint64_t hits = 0, misses = 0, stale_served = 0, invalidated = 0;
+  };
+
+  explicit Cache(size_t max_entries, Now now = Clock::now) : max_(max_entries ? max_entries : 1), now_(std::move(now)) {}
+
+  // ttl_s <= 0 means "do not cache".
+  void put(const std::string& tenant, int kind, const std::string& key, bool found, int64_t version, int32_t ttl_s,
+           std::string payload) {
+    if (ttl_s <= 0) return;
+    std::lock_guard<std::mutex> l(mu_);
+    // version 0 = unversioned, exempt; otherwise refuse answers older than a seen Invalidate
+    if (version != 0 && version < floor_of(tenant, kind)) return;
+    std::string id = make_id(tenant, kind, key);
+    auto it = index_.find(id);
+    if (it != index_.end()) {
+      lru_.erase(it->second);
+      index_.erase(it);
+    }
+    auto t = now_();
+    lru_.push_front(Node{tenant, kind, key, id, Entry{found, version, std::move(payload), ttl_s, false},
+                         t + std::chrono::seconds(ttl_s), t});
+    index_[id] = lru_.begin();
+    while (lru_.size() > max_) {
+      index_.erase(lru_.back().id);
+      lru_.pop_back();
+    }
+  }
+
+  // A fresh entry is a hit. An expired entry is a hit only when allow_stale;
+  // otherwise the call is a miss and the entry stays until it is replaced,
+  // invalidated or evicted by the LRU cap.
+  bool get(const std::string& tenant, int kind, const std::string& key, bool allow_stale, Entry* out) {
+    std::lock_guard<std::mutex> l(mu_);
+    auto it = index_.find(make_id(tenant, kind, key));
+    if (it == index_.end()) {
+      ++st_.misses;
+      return false;
+    }
+    Node& n = *it->second;
+    bool expired = now_() >= n.expires;
+    if (expired && !allow_stale) {  // kept: a later failed refresh may still serve it stale
+      ++st_.misses;
+      return false;
+    }
+    lru_.splice(lru_.begin(), lru_, it->second);
+    *out = n.e;
+    out->stale = expired;
+    expired ? ++st_.stale_served : ++st_.hits;
+    return true;
+  }
+
+  // Survival read: the TTL is ignored, the age is not. An entry put no more than max_age ago is served (stale is
+  // set when it is past its TTL). Counters and LRU order are left alone.
+  bool get_within(const std::string& tenant, int kind, const std::string& key, std::chrono::seconds max_age, Entry* out) {
+    std::lock_guard<std::mutex> l(mu_);
+    auto it = index_.find(make_id(tenant, kind, key));
+    if (it == index_.end()) return false;
+    const Node& n = *it->second;
+    auto t = now_();
+    if (t - n.stored > max_age) return false;
+    *out = n.e;
+    out->stale = t >= n.expires;
+    return true;
+  }
+
+  // Drops entries of `tenant` older than `version`. kind 0 matches every kind;
+  // key "*" matches every key. Returns how many were dropped.
+  size_t invalidate(const std::string& tenant, int kind, const std::string& key, int64_t version) {
+    std::lock_guard<std::mutex> l(mu_);
+    if (key == "*") {
+      int64_t& f = floors_[make_id(tenant, kind, "")];
+      if (version > f) f = version;
+    }
+    size_t dropped = 0;
+    for (auto it = lru_.begin(); it != lru_.end();) {
+      bool match = it->tenant == tenant && (kind == 0 || it->kind == kind) && (key == "*" || it->key == key) &&
+                   it->e.version < version;
+      if (match) {
+        index_.erase(it->id);
+        it = lru_.erase(it);
+        ++dropped;
+      } else {
+        ++it;
+      }
+    }
+    st_.invalidated += dropped;
+    return dropped;
+  }
+
+  // Marks every entry expired without deleting it: fail-static can still serve
+  // it stale, the next normal lookup refetches. Version floors are untouched.
+  void expire_all() {
+    std::lock_guard<std::mutex> l(mu_);
+    auto t = now_();
+    for (auto& n : lru_) n.expires = t;
+  }
+
+  void clear() {
+    std::lock_guard<std::mutex> l(mu_);
+    lru_.clear();
+    index_.clear();
+  }
+
+  Stats stats() {
+    std::lock_guard<std::mutex> l(mu_);
+    Stats s = st_;
+    s.entries = lru_.size();
+    return s;
+  }
+
+ private:
+  struct Node {
+    std::string tenant;
+    int kind;
+    std::string key;
+    std::string id;
+    Entry e;
+    Clock::time_point expires;
+    Clock::time_point stored;
+  };
+  int64_t floor_of(const std::string& tenant, int kind) const {
+    int64_t f = 0;
+    for (int k : {kind, 0}) {
+      auto it = floors_.find(make_id(tenant, k, ""));
+      if (it != floors_.end() && it->second > f) f = it->second;
+    }
+    return f;
+  }
+  static std::string make_id(const std::string& tenant, int kind, const std::string& key) {
+    return tenant + '\x1f' + std::to_string(kind) + '\x1f' + key;
+  }
+
+  std::mutex mu_;
+  size_t max_;
+  Now now_;
+  std::list<Node> lru_;
+  std::unordered_map<std::string, std::list<Node>::iterator> index_;
+  std::unordered_map<std::string, int64_t> floors_;  // (tenant, kind) -> highest Invalidate version; kept by clear()
+  Stats st_;
+};
+
+}  // namespace gb

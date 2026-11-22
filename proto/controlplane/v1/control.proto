@@ -1,0 +1,404 @@
+// Convention: every `tenant_id` field on the wire is the tenant's `tenant.uuid`
+// (the CHAR(36) public reference), never the integer `tenant.id` row id.
+syntax = "proto3";
+
+package controlplane.v1;
+
+option go_package = "eswitch/engine/gen/controlplane/v1;controlplanev1";
+
+// Each FreeSWITCH node opens exactly one Connect stream to the engine.
+// The first NodeMessage on the stream MUST be Hello.
+service ControlPlane {
+  rpc Connect(stream NodeMessage) returns (stream EngineMessage);
+}
+
+message NodeMessage {
+  string request_id = 1;
+  oneof body {
+    Hello hello = 2;
+    Heartbeat heartbeat = 3;
+    LookupRequest lookup = 4;
+    RouteRequest route_request = 5;
+    CallEvent call_event = 6;
+    CommandResult command_result = 7;
+    StepResult step_result = 8; // answered with a RouteResponse carrying the next batch
+    ConfEvent conf_event = 9;
+  }
+}
+
+message EngineMessage {
+  string request_id = 1;
+  oneof body {
+    HelloAck hello_ack = 2;
+    LookupResponse lookup_response = 3;
+    Invalidate invalidate = 4;
+    RouteResponse route_response = 5;
+    Command command = 6;
+    TokenRotate token_rotate = 7;
+  }
+}
+
+message Hello {
+  string node_id = 1;
+  string version = 2;
+  string token = 3;
+  repeated string tags = 4;
+  int32 capacity = 5;
+  // Process generation. Empty means this build does not report one: the engine
+  // must not treat that Hello as a restart. One process sends one id; a new
+  // process sends a new one.
+  string boot_id = 6;
+}
+
+message HelloAck {
+  bool accepted = 1;
+  string reason = 2;
+  string session_id = 3;
+  int32 heartbeat_interval_s = 4;
+}
+
+message Heartbeat {
+  int32 active_calls = 1;
+  int32 cpu_pct = 2;
+  int64 ts_unix_ms = 3;
+}
+
+enum LookupKind {
+  LOOKUP_KIND_UNSPECIFIED = 0;
+  LOOKUP_KIND_DIRECTORY = 1;
+  LOOKUP_KIND_DIALPLAN = 2;
+  LOOKUP_KIND_CONFIG = 3;
+  LOOKUP_KIND_XML = 4; // a FreeSWITCH XML fragment: key dialplan/<context> or configuration/<name>
+}
+
+message LookupRequest {
+  string tenant_id = 1;
+  LookupKind kind = 2;
+  string key = 3;
+  map<string, string> params = 4; // per-call XML fetch only; a request with params is never cached
+}
+
+message LookupResponse {
+  bool found = 1;
+  int64 version = 2;
+  int32 ttl_s = 3;
+  bytes payload = 4; // JSON document, or for LOOKUP_KIND_XML a FreeSWITCH XML fragment; opaque to the transport
+  // The engine could not answer (backend failure or timeout). This is not
+  // "not found": nodes must not cache it and should serve stale data or fail.
+  bool unavailable = 5;
+}
+
+message Invalidate {
+  string tenant_id = 1;
+  LookupKind kind = 2;
+  string key = 3;
+  int64 version = 4;
+}
+
+message RouteRequest {
+  string tenant_id = 1;
+  string call_id = 2;
+  string uuid = 3;
+  string domain = 4;
+  string caller_id_number = 5;
+  string destination_number = 6;
+  map<string, string> vars = 7;
+}
+
+message RouteResponse {
+  repeated Command commands = 1;
+  // The engine could not decide (backend failure or timeout): the node should
+  // reject the call with a temporary failure rather than treat it as routed.
+  bool unavailable = 2;
+  // An operator API route matched (RM-27): the node runs these actions instead
+  // of commands. Sent only to nodes whose Hello carried the tag "api-batch".
+  ApiBatch api_batch = 3;
+}
+
+message ApiAction {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    SET_HEADER = 1;
+    UNSET_HEADER = 2;
+    SET_VAR = 3;
+    API = 4;
+    BGAPI = 5;
+    XML = 6;
+  }
+  Kind kind = 1;
+  string name = 2;
+  string value = 3;
+}
+
+message ApiBatch {
+  string rule_id = 1; // api_route.uuid
+  repeated ApiAction actions = 2;
+}
+
+enum CallEventType {
+  CALL_EVENT_TYPE_UNSPECIFIED = 0;
+  CALL_EVENT_TYPE_CREATED = 1;
+  CALL_EVENT_TYPE_ANSWERED = 2;
+  CALL_EVENT_TYPE_DTMF = 3;
+  CALL_EVENT_TYPE_HANGUP = 4;
+}
+
+message CallEvent {
+  string tenant_id = 1;
+  string call_id = 2;
+  string uuid = 3;
+  CallEventType type = 4;
+  string digit = 5;
+  string cause = 6;
+  int64 ts_unix_ms = 7;
+  string peer_tenant_id = 9; // engine-authorized device peer; call ownership remains tenant_id
+  string peer = 8; // ANSWERED: the number the leg dialled (a queue agent's extension for a leg the engine bridged)
+}
+
+enum SuperviseModeKind {
+  SUPERVISE_MODE_UNSPECIFIED = 0;
+  SUPERVISE_MODE_LISTEN = 1;
+  SUPERVISE_MODE_WHISPER = 2;
+  SUPERVISE_MODE_BARGE = 3;
+}
+
+// Commands always carry tenant_id; the engine checks it against the channel
+// owner before acting on a uuid. Collect, Record, Conference, Sleep and Amd only
+// run inline on the call they name (the engine's answer to a RouteRequest or
+// StepResult); the stream path refuses them.
+message Command {
+  string command_id = 1;
+  string tenant_id = 2;
+  oneof action {
+    Originate originate = 3;
+    Bridge bridge = 4;
+    Park park = 5;
+    Playback playback = 6;
+    Hangup hangup = 7;
+    Drain drain = 8;
+    Collect collect = 9;
+    Record record = 10;
+    Conference conference = 11;
+    Sleep sleep = 12;
+    Eavesdrop eavesdrop = 14;
+    SuperviseMode supervise_mode = 15;
+    Announce announce = 16;
+    Transfer transfer = 17;
+    BridgeLegs bridge_legs = 18;
+    ConferenceControl conference_control = 19;
+    Amd amd = 20;
+  }
+  // Set only on the last command of a batch, and only when the node must
+  // report how it ended (a StepResult echoing this id). Empty: no report.
+  string step_id = 13;
+}
+
+message Transfer {
+  string uuid = 1;
+  string token = 2;
+}
+
+message BridgeLegs {
+  string uuid_a = 1;
+  string uuid_b = 2;
+}
+
+message Eavesdrop {
+  string uuid = 1;
+  string target_uuid = 2;
+  SuperviseModeKind mode = 3;
+}
+
+message SuperviseMode {
+  string uuid = 1;
+  SuperviseModeKind mode = 2;
+}
+
+message Announce {
+  string uuid = 1;
+  string prompt = 2;
+  bool leg_only = 3;
+}
+
+message Originate {
+  string dial_string = 1;
+  map<string, string> vars = 2;
+  int32 timeout_s = 3;
+  // When the far end answers, the new leg is handed to the engine like a call that arrived (grpc_route) instead of being
+  // parked. The node sets the request domain to dialer.invalid itself and accepts only the variables call_id,
+  // origination_uuid and dialer_token on such a leg; the engine recognises the call by that one-time token. The leg
+  // carries no X-Tenant-Id header: it goes to a carrier.
+  bool route_on_answer = 4;
+}
+
+message Bridge {
+  string peer_tenant_id = 4;
+  string peer_caller_id = 5;
+  string uuid = 1;
+  string dial_string = 2;
+  int32 timeout_s = 3;
+}
+
+message Park {
+  string uuid = 1;
+}
+
+message Playback {
+  string uuid = 1;
+  string file = 2;
+}
+
+message Hangup {
+  string uuid = 1;
+  string cause = 2;
+}
+
+message Drain {
+  int32 deadline_s = 1;
+}
+
+// Plays prompt (empty: silence) and reads digits. terminators is a subset of
+// "0123456789#*". The node refuses min_digits < 0, max_digits outside 1..32,
+// min_digits > max_digits, timeout_ms outside 1..60000 (0 would mean no timeout).
+message Collect {
+  string uuid = 1;
+  string prompt = 2;
+  int32 min_digits = 3;
+  int32 max_digits = 4;
+  int32 timeout_ms = 5;
+  string terminators = 6;
+}
+
+// Records the caller to <record-dir>/<tenant>/<name>.wav. name is one path
+// component. silence_s > 0 stops after that many seconds of silence.
+message Record {
+  string uuid = 1;
+  string name = 2;
+  int32 max_len_s = 3;
+  int32 silence_s = 4;
+  bool beep = 5;
+  string upload_url = 6; // non-empty: after recording, the node PUTs the file to this presigned http(s) URL and reports uploaded
+}
+
+// Joins room "<tenant>_<room>" on profile (empty: "default"); returns when the
+// caller leaves the conference or hangs up.
+message Conference {
+  string uuid = 1;
+  string room = 2;
+  string profile = 3;
+  bool mute = 4; // join muted
+  bool moderator = 5; // join with the FreeSWITCH moderator flag
+  bool wait_for_moderator = 6; // members wait, muted, until a moderator is in the room
+}
+
+enum ConferenceAction {
+  CONFERENCE_ACTION_UNSPECIFIED = 0;
+  CONFERENCE_ACTION_MUTE = 1;
+  CONFERENCE_ACTION_UNMUTE = 2;
+  CONFERENCE_ACTION_MUTE_ALL = 3;
+  CONFERENCE_ACTION_UNMUTE_ALL = 4;
+  CONFERENCE_ACTION_KICK = 5;
+  CONFERENCE_ACTION_LOCK = 6;
+  CONFERENCE_ACTION_UNLOCK = 7;
+  CONFERENCE_ACTION_END = 8;
+  CONFERENCE_ACTION_RECORD_START = 9;
+  CONFERENCE_ACTION_RECORD_STOP = 10;
+}
+
+// Stream command, no channel: the room is "<command tenant>_<room>". The member actions name a channel that must
+// belong to the command's tenant and sit in that room. mute_all and unmute_all spare moderators.
+message ConferenceControl {
+  string room = 1;
+  ConferenceAction action = 2;
+  string member_uuid = 3;
+  string upload_url = 4;
+  string rec_id = 5;
+  int32 max_s = 6;
+  string recording_prompt = 7;
+}
+
+message ConfEvent {
+  enum Type { UNSPECIFIED = 0; RECORDING_DONE = 1; ROOM_READY = 2; }
+  Type type = 1;
+  string tenant = 2;
+  string room = 3;
+  string rec_id = 4;
+  int64 length_ms = 5;
+  bool uploaded = 6;
+  string member_uuid = 7;
+  string room_instance = 8;
+}
+
+message Sleep {
+  string uuid = 1;
+  int32 ms = 2; // 0..60000
+}
+
+// Inline only. The node runs the mod_amd application on this session and
+// reports amd_result / amd_cause. The stream path refuses it.
+message Amd {
+  string uuid = 1;
+}
+
+// result is HUMAN, MACHINE, or NOTSURE. cause is the module's reason
+// (HUMAN, INITIALSILENCE, LONGGREETING, MAXWORDS, MAXWORDLENGTH, TOOLONG).
+message AmdOutcome {
+  string result = 1;
+  string cause = 2;
+}
+
+// The node's report on the last command of a batch, sent as a request
+// (request_id) and answered with a RouteResponse: the next batch. Retrying
+// with the same step_id is safe.
+message StepResult {
+  string tenant_id = 1;
+  string call_id = 2;
+  string uuid = 3;
+  string step_id = 4;
+  oneof outcome {
+    BridgeOutcome bridge = 5;
+    CollectOutcome collect = 6;
+    PlaybackOutcome playback = 7;
+    RecordOutcome record = 8;
+    ConferenceOutcome conference = 9;
+    SleepOutcome sleep = 10;
+    EavesdropOutcome eavesdrop = 13;
+    AmdOutcome amd = 14;
+  }
+  string error = 11;  // non-empty: the command could not run
+  bool hung_up = 12;  // the caller was gone when it ended; the reply is ignored
+  map<string, string> vars = 15; // operator-listed channel variables (route-vars), read when the step ended
+}
+
+message BridgeOutcome {
+  bool answered = 1;
+  string cause = 2;    // hangup cause of the far leg, or the failure (USER_BUSY, NO_ANSWER, ...)
+  int32 elapsed_s = 3; // wall time since the bridge started, ring time included
+}
+message CollectOutcome {
+  string digits = 1;
+  bool timed_out = 2;
+}
+message PlaybackOutcome {}
+message RecordOutcome {
+  string path = 1;
+  int32 length_ms = 2;
+  bool uploaded = 3;
+}
+message ConferenceOutcome {}
+message SleepOutcome {}
+message EavesdropOutcome {}
+
+// Sent by the engine when it rotates a node's token. The node persists the new
+// token and uses it from its next Hello; the old token stays valid on the
+// engine for overlap_s seconds.
+message TokenRotate {
+  string token = 1;
+  int32 overlap_s = 2;
+}
+
+message CommandResult {
+  string command_id = 1;
+  bool ok = 2;
+  string error = 3;
+}

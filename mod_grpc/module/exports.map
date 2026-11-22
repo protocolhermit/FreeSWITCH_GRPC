@@ -1,0 +1,6 @@
+{
+  global:
+    mod_grpc_module_interface;
+  local:
+    *;
+};
