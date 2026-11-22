@@ -35,7 +35,7 @@ static inline int pl_target_ok(const char *t)
 }
 
 /* local_dial may be "". Returns 1 and the joined dial string in out, 0 on any refusal (out is then empty).
- * The local part is vetted by dg_safe_dial; the hop legs carry '<' '>' and are built only from validated pieces. */
+ * The local part is vetted by dg_safe_dial; the hop legs are built only from validated pieces. */
 static inline int pl_build(const char *local_dial, const char *const *peers, size_t npeers, const char *profile,
 						   const char *target, const char *tenant, int on_hop, char *out, size_t outlen)
 {
@@ -52,7 +52,10 @@ static inline int pl_build(const char *local_dial, const char *const *peers, siz
 	for (i = 0; i < npeers; i++) {
 		int w;
 		if (!pl_addr_ok(peers[i])) goto fail;
-		w = snprintf(out + n, outlen - n, "%s[sip_h_X-Tenant-Id=%s,sip_h_X-Grpc-Hop=1]sofia/%s/%s;fs_path=<sip:%s>", n ? "," : "",
+		/* fs_path=sip:<peer>, no angle brackets: sofia then keeps sip:<target> as the Request-URI and To and adds
+		 * Route: <sip:<peer>>. With fs_path=<sip:...> (brackets) it sends the INVITE to sip:<peer> itself, losing the
+		 * user and the domain the peer routes on (seen live, FreeSWITCH 1.11). */
+		w = snprintf(out + n, outlen - n, "%s[sip_h_X-Tenant-Id=%s,sip_h_X-Grpc-Hop=1]sofia/%s/%s;fs_path=sip:%s", n ? "," : "",
 					 tenant, profile, target, peers[i]);
 		if (w < 0 || (size_t) w >= outlen - n) goto fail;
 		n += (size_t) w;
