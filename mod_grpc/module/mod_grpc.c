@@ -25,6 +25,7 @@
 #include "api_guard.h"
 #include "xml_fetch.h"
 #include "tenant.h"
+#include "directory_xml.h"
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load);
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_grpc_shutdown);
@@ -676,19 +677,6 @@ static int tenant_for(switch_channel_t *channel, const char *domain, char *out, 
 
 /* ------------------------------------------------------ directory binding */
 
-static void xml_escape(switch_stream_handle_t *s, const char *in)
-{
-	for (; in && *in; in++) {
-		switch (*in) {
-		case '&': s->write_function(s, "&amp;"); break;
-		case '<': s->write_function(s, "&lt;"); break;
-		case '>': s->write_function(s, "&gt;"); break;
-		case '"': s->write_function(s, "&quot;"); break;
-		default: s->write_function(s, "%c", *in);
-		}
-	}
-}
-
 /* Answers FreeSWITCH's directory questions from the engine: the user's entry
  * for a domain, with the tenant as a channel variable. */
 static switch_xml_t directory_search(const char *section, const char *tag_name, const char *key_name, const char *key_value,
@@ -716,22 +704,31 @@ static switch_xml_t directory_search(const char *section, const char *tag_name, 
 		return NULL;
 	}
 	{
-		cJSON *name = cJSON_GetObjectItem(j, "name");
-		SWITCH_STANDARD_STREAM(xml);
-		xml.write_function(&xml, "<document type=\"freeswitch/xml\"><section name=\"directory\"><domain name=\"");
-		xml_escape(&xml, domain);
-		xml.write_function(&xml, "\"><user id=\"");
-		xml_escape(&xml, user);
-		xml.write_function(&xml, "\"><params/><variables>");
-		xml.write_function(&xml, "<variable name=\"tenant_id\" value=\"");
-		xml_escape(&xml, tenant);
-		xml.write_function(&xml, "\"/><variable name=\"user_context\" value=\"default\"/><variable name=\"effective_caller_id_number\" value=\"");
-		xml_escape(&xml, user);
-		xml.write_function(&xml, "\"/><variable name=\"effective_caller_id_name\" value=\"");
-		xml_escape(&xml, name && cJSON_IsString(name) ? name->valuestring : user);
-		xml.write_function(&xml, "\"/></variables></user></domain></section></document>");
-		result = switch_xml_parse_str_dup((char *) xml.data);
-		switch_safe_free(xml.data);
+		cJSON *name = cJSON_GetObjectItem(j, "name"), *a1 = cJSON_GetObjectItem(j, "a1_hash"), *pw = cJSON_GetObjectItem(j, "password");
+		cJSON *vars = cJSON_GetObjectItem(j, "vars"), *v;
+		const char *names[DX_MAX_VARS], *values[DX_MAX_VARS];
+		char buf[16384];
+		dx_user_t u = { 0 };
+		u.domain = domain;
+		u.user = user;
+		u.tenant = tenant;
+		u.name = name && cJSON_IsString(name) ? name->valuestring : NULL;
+		u.a1_hash = a1 && cJSON_IsString(a1) ? a1->valuestring : NULL;
+		u.password = pw && cJSON_IsString(pw) ? pw->valuestring : NULL;
+		u.var_allow = globals.var_allow;
+		u.with_auth = globals.directory_auth;
+		u.with_dial_string = globals.reg_mode != TN_MODE_EDGE;
+		u.var_names = names;
+		u.var_values = values;
+		if (cJSON_IsObject(vars)) {
+			cJSON_ArrayForEach(v, vars) {
+				if (u.nvars >= DX_MAX_VARS) break;
+				if (!v->string || !cJSON_IsString(v)) continue;
+				names[u.nvars] = v->string;
+				values[u.nvars++] = v->valuestring;
+			}
+		}
+		if (dx_user_xml(&u, buf, sizeof buf)) result = switch_xml_parse_str_dup(buf);
 	}
 	cJSON_Delete(j);
 	gb_lookup_result_free(&r);
