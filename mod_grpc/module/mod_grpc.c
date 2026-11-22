@@ -1780,7 +1780,7 @@ static switch_bool_t survival_route(switch_core_session_t *session)
 	tenant = tenant ? switch_core_session_strdup(session, tenant) : NULL;
 	domain = domain ? switch_core_session_strdup(session, domain) : NULL;
 	/* edge: the header alone, as before. local/engine have no edge to stamp it, so the configured tenancy decides. */
-	if (globals.reg_mode != TN_MODE_EDGE) {
+	if (globals.reg_mode != TN_MODE_EDGE || globals.tenancy_single) {
 		tenant = tenant_for(channel, domain, resolved, sizeof resolved) != TN_SRC_NONE ? switch_core_session_strdup(session, resolved) : NULL;
 	}
 	if (!dg_uuid_shaped(tenant) || zstr(domain)) return SWITCH_FALSE;
@@ -1956,6 +1956,11 @@ SWITCH_STANDARD_APP(grpc_route_function)
 	call_id = call_id ? switch_core_session_strdup(session, call_id) : NULL;
 	domain = domain ? switch_core_session_strdup(session, domain) : NULL;
 	tenant = tenant_for(channel, domain, resolved, sizeof(resolved)) != TN_SRC_NONE ? switch_core_session_strdup(session, resolved) : NULL;
+	if (zstr(tenant) && globals.reg_mode != TN_MODE_EDGE) { /* spec 5.2: no tenant outside edge means no call; edge sends tenant_id="" as before */
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "no tenant for domain %s: rejecting the call\n", zstr(domain) ? "-" : domain);
+		switch_channel_hangup(channel, SWITCH_CAUSE_NORMAL_TEMPORARY_FAILURE);
+		return;
+	}
 	if (zstr(call_id)) call_id = uuid;
 	switch_channel_set_variable(channel, "call_id", call_id);
 	if (!zstr(tenant)) switch_channel_set_variable(channel, "tenant_id", tenant);
@@ -2214,7 +2219,7 @@ static switch_xml_t xml_fetch_search(const char *section, const char *tag_name, 
 	const char *tenant = "", *context = NULL;
 	gb_lookup_result_t r;
 	switch_xml_t x, sec;
-	int rc, dialplan, acl = 0;
+	int rc, dialplan, acl = 0, hdr_ok = 1;
 	int64_t version;
 
 	if (!globals.bridge || !section) return NULL;
@@ -2223,7 +2228,13 @@ static switch_xml_t xml_fetch_search(const char *section, const char *tag_name, 
 		if (!params) return NULL;
 		context = switch_event_get_header(params, "Hunt-Context");
 		if (!xf_dialplan_key(&globals.xf, context, key, sizeof(key))) return NULL;
-		tenant = xf_tenant(switch_event_get_header(params, "variable_tenant_id"), switch_event_get_header(params, "variable_sip_h_X-Tenant-Id"));
+		{ /* the phone's X-Tenant-Id counts only when tenant_for would trust it (spec 5.2) */
+			int acl_set = !zstr(globals.tenant_header_acl), pass = 0;
+			const char *ip = switch_event_get_header(params, "variable_network_addr");
+			if (acl_set) pass = !zstr(ip) && switch_check_network_list_ip(ip, globals.tenant_header_acl) ? 1 : 0;
+			hdr_ok = tn_header_trusted(globals.reg_mode, acl_set, pass);
+		}
+		tenant = xf_tenant(switch_event_get_header(params, "variable_tenant_id"), hdr_ok ? switch_event_get_header(params, "variable_sip_h_X-Tenant-Id") : NULL);
 	} else if (!strcmp(section, "configuration")) {
 		if (!xf_conf_key(&globals.xf, key_value, key, sizeof(key))) return NULL;
 		acl = !strcmp(key, XF_ACL_KEY);
@@ -2241,6 +2252,7 @@ static switch_xml_t xml_fetch_search(const char *section, const char *tag_name, 
 		if (!(kv = calloc(n ? n : 1, sizeof(*kv)))) return NULL;
 		for (hp = params->headers; hp; hp = hp->next) {
 			if (zstr(hp->name) || !hp->value || !xf_utf8_ok(hp->name) || !xf_utf8_ok(hp->value)) continue; /* see xf_utf8_ok */
+			if (!hdr_ok && !strcasecmp(hp->name, "variable_sip_h_X-Tenant-Id")) continue; /* an untrusted claim is not forwarded */
 			kv[i].key = hp->name;
 			kv[i++].value = hp->value;
 		}
