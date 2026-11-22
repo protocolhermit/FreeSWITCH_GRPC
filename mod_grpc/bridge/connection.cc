@@ -223,6 +223,8 @@ bool gb_bridge::run_stream(const std::string& target, const std::string& host) {
   h->set_token(tok);
   h->set_capacity(capacity);
   h->set_boot_id(boot_id);
+  h->set_sip_address(sip_address);
+  h->set_registration_mode(registration_mode);
   for (auto& t : split(tags, ',')) h->add_tags(t);
 
   // The watchdog cancels the stream when no HelloAck arrives in time.
@@ -405,6 +407,8 @@ gb_bridge_t* gb_create(const gb_config_t* cfg, const gb_callbacks_t* cb, void* u
     b->tags = gb::str(cfg->tags);
     b->capacity = cfg->capacity;
     b->boot_id = new_boot_id();
+    b->sip_address = gb::str(cfg->sip_address);
+    b->registration_mode = gb::str(cfg->registration_mode);
     b->tls_ca = gb::str(cfg->tls_ca);
     b->tls_cert = gb::str(cfg->tls_cert);
     b->tls_key = gb::str(cfg->tls_key);

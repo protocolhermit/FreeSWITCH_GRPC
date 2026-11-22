@@ -83,6 +83,8 @@ typedef struct {
 	int keepalive_ms;            /* HTTP/2 keepalive ping interval, 0 = 30000 */
 	int survival_refresh_s;      /* 0 = survival cache off; else the periodic refetch interval */
 	int survival_max_age_s;      /* 0 = 86400: how long a fetched snapshot may be served with no engine */
+	const char *sip_address;       /* host:port of this node's SIP profile, may be NULL */
+	const char *registration_mode; /* "engine" or "local", may be NULL */
 } gb_config_t;
 
 typedef struct {
@@ -119,6 +121,9 @@ typedef struct {
 	int moderator;           /* Conference: join with the moderator flag */
 	int wait_for_moderator;  /* Conference: members wait until a moderator is in */
 	int32_t conf_action;     /* ConferenceControl: 1=mute 2=unmute 3=mute_all 4=unmute_all 5=kick 6=lock 7=unlock 8=end 9=record_start 10=record_stop (room in room, member in target_uuid) */
+	const char *const *peer_addresses; /* Bridge: hop addresses, npeer_addresses entries */
+	size_t npeer_addresses;
+	const char *peer_target;           /* Bridge: user@domain for the hop legs */
 } gb_command_t;
 
 typedef struct {
@@ -250,6 +255,20 @@ int gb_step(gb_bridge_t *b, const gb_step_result_t *s, int timeout_ms, gb_route_
 
 /* fire and forget; GB_ERR_DISCONNECTED when there is no stream, GB_ERR_QUEUE_FULL when the send queue is full */
 int gb_send_call_event(gb_bridge_t *b, const char *tenant, const char *call_id, const char *uuid, int type, const char *digit, const char *cause, const char *peer, const char *peer_tenant);
+#define GB_REG_REGISTER 1
+#define GB_REG_UNREGISTER 2
+#define GB_REG_EXPIRE 3
+typedef struct {
+	int type; /* GB_REG_* */
+	const char *tenant_id, *user, *domain, *contact;
+	int32_t expires_s;
+	const char *network_ip;
+	int32_t network_port;
+	const char *user_agent, *call_id;
+	int resync;
+} gb_reg_event_t;
+/* GB_ERR_ARG on NULL or a bad type, otherwise as gb_send_call_event. */
+int gb_send_reg_event(gb_bridge_t *b, const gb_reg_event_t *e);
 /* Conference lifecycle events: type 1=recording done, 2=room ready. */
 int gb_send_conf_event(gb_bridge_t *b, int type, const char *tenant,
     const char *room, const char *rec_id, int64_t length_ms, int uploaded,

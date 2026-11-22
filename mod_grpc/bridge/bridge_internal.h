@@ -107,7 +107,7 @@ struct Session {
 
 struct gb_bridge {
   // configuration (owned copies)
-  std::string endpoints, node_id, version, tags, tls_ca, tls_cert, tls_key, tls_server_name;
+  std::string endpoints, node_id, version, tags, tls_ca, tls_cert, tls_key, tls_server_name, sip_address, registration_mode;
   int32_t capacity = 0;
   int hello_timeout_ms = 10000, backoff_min_ms = 500, backoff_max_ms = 15000, keepalive_ms = 30000;
   gb_callbacks_t cb{};

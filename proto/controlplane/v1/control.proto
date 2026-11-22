@@ -23,6 +23,7 @@ message NodeMessage {
     CommandResult command_result = 7;
     StepResult step_result = 8; // answered with a RouteResponse carrying the next batch
     ConfEvent conf_event = 9;
+    RegEvent reg_event = 10;
   }
 }
 
@@ -48,6 +49,8 @@ message Hello {
   // must not treat that Hello as a restart. One process sends one id; a new
   // process sends a new one.
   string boot_id = 6;
+  string sip_address = 7;       // host:port the node's SIP profile listens on; empty when unset
+  string registration_mode = 8; // "engine" or "local"; empty when unset
 }
 
 message HelloAck {
@@ -155,6 +158,26 @@ message CallEvent {
   string peer = 8; // ANSWERED: the number the leg dialled (a queue agent's extension for a leg the engine bridged)
 }
 
+message RegEvent {
+  enum Type {
+    UNSPECIFIED = 0;
+    REGISTER = 1;
+    UNREGISTER = 2;
+    EXPIRE = 3;
+  }
+  Type type = 1;
+  string tenant_id = 2;
+  string user = 3;
+  string domain = 4;
+  string contact = 5;
+  int32 expires_s = 6;
+  string network_ip = 7;
+  int32 network_port = 8;
+  string user_agent = 9;
+  string call_id = 10;
+  bool resync = 11;
+}
+
 enum SuperviseModeKind {
   SUPERVISE_MODE_UNSPECIFIED = 0;
   SUPERVISE_MODE_LISTEN = 1;
@@ -237,6 +260,8 @@ message Bridge {
   string uuid = 1;
   string dial_string = 2;
   int32 timeout_s = 3;
+  repeated string peer_addresses = 6; // SIP hop addresses (host:port) of the nodes holding the peer's registrations
+  string peer_target = 7;             // user@domain for the hop legs; dial_string may be empty
 }
 
 message Park {

@@ -24,7 +24,8 @@ int64_t now_ms() {
 // buffer (borrow_cstr) or a malloc'd copy (dup_cstr). Originate variables go
 // to *vars as pointers into c; the caller decides how to keep them.
 // False when the command has no action.
-bool fill(const cp::Command& c, gb_command_t* o, const char* (*str)(const std::string&), std::vector<gb_kv_t>* vars) {
+bool fill(const cp::Command& c, gb_command_t* o, const char* (*str)(const std::string&), std::vector<gb_kv_t>* vars,
+          std::vector<const char*>* peers) {
   o->command_id = str(c.command_id());
   o->tenant_id = str(c.tenant_id());
   o->step_id = str(c.step_id());
@@ -43,6 +44,8 @@ bool fill(const cp::Command& c, gb_command_t* o, const char* (*str)(const std::s
       o->peer_tenant_id = str(c.bridge().peer_tenant_id());
       o->peer_caller_id = str(c.bridge().peer_caller_id());
       o->timeout_s = c.bridge().timeout_s();
+      o->peer_target = str(c.bridge().peer_target());
+      for (auto& a : c.bridge().peer_addresses()) peers->push_back(str(a));
       return true;
     case cp::Command::kPark:
       o->type = GB_CMD_PARK;
@@ -169,7 +172,20 @@ int export_commands(const cp::RouteResponse& r, gb_route_result_t* out) {
   for (const cp::Command& c : cmds) {
     gb_command_t& o = out->cmds[i++];
     std::vector<gb_kv_t> vars;
-    if (!fill(c, &o, dup_cstr, &vars) || vars.empty()) continue;
+    std::vector<const char*> peers;  // already dup'd by fill
+    if (!fill(c, &o, dup_cstr, &vars, &peers)) continue;
+    if (!peers.empty()) {
+      const char** pa = static_cast<const char**>(std::calloc(peers.size(), sizeof(char*)));
+      if (!pa) {
+        for (const char* p : peers) std::free(const_cast<char*>(p));
+        gb_route_result_free(out);
+        return GB_ERR_INTERNAL;
+      }
+      std::memcpy(pa, peers.data(), peers.size() * sizeof(char*));
+      o.peer_addresses = pa;
+      o.npeer_addresses = peers.size();
+    }
+    if (vars.empty()) continue;
     gb_kv_t* kv = static_cast<gb_kv_t*>(std::calloc(vars.size(), sizeof(gb_kv_t)));
     if (!kv) {
       gb_route_result_free(out);
@@ -191,12 +207,15 @@ int export_commands(const cp::RouteResponse& r, gb_route_result_t* out) {
 void gb_bridge::on_command(const cp::Command& c) {
   gb_command_t out{};
   std::vector<gb_kv_t> vars;
-  if (!fill(c, &out, borrow_cstr, &vars)) {
+  std::vector<const char*> peers;
+  if (!fill(c, &out, borrow_cstr, &vars, &peers)) {
     log(GB_LOG_WARN, "command %s has no action", c.command_id().c_str());
     return;
   }
   out.vars = vars.data();
   out.nvars = vars.size();
+  out.peer_addresses = peers.data();
+  out.npeer_addresses = peers.size();
   cb.on_command(ud, &out);
 }
 
@@ -329,6 +348,9 @@ void gb_route_result_free(gb_route_result_t* r) {
     std::free(const_cast<char*>(c.rec_id));
     std::free(const_cast<char*>(c.target_uuid));
     std::free(const_cast<char*>(c.token));
+    std::free(const_cast<char*>(c.peer_target));
+    for (size_t k = 0; k < c.npeer_addresses; k++) std::free(const_cast<char*>(c.peer_addresses[k]));
+    std::free(const_cast<char**>(c.peer_addresses));
     for (size_t k = 0; k < c.nvars; k++) {
       std::free(const_cast<char*>(c.vars[k].key));
       std::free(const_cast<char*>(c.vars[k].value));
@@ -357,6 +379,30 @@ int gb_send_call_event(gb_bridge_t* b, const char* tenant, const char* call_id, 
     e->set_peer(gb::text(peer));
     e->set_peer_tenant_id(gb::text(peer_tenant));
     e->set_ts_unix_ms(now_ms());
+    return s->send(std::move(m));
+  } catch (...) {
+    return GB_ERR_INTERNAL;
+  }
+}
+
+int gb_send_reg_event(gb_bridge_t* b, const gb_reg_event_t* r) {
+  try {
+    if (!b || !r || r->type < GB_REG_REGISTER || r->type > GB_REG_EXPIRE) return GB_ERR_ARG;
+    auto s = b->current();
+    if (!s || !b->connected) return GB_ERR_DISCONNECTED;
+    cp::NodeMessage m;
+    cp::RegEvent* e = m.mutable_reg_event();
+    e->set_type(static_cast<cp::RegEvent::Type>(r->type));
+    e->set_tenant_id(gb::text(r->tenant_id));
+    e->set_user(gb::text(r->user));
+    e->set_domain(gb::text(r->domain));
+    e->set_contact(gb::text(r->contact));
+    e->set_expires_s(r->expires_s);
+    e->set_network_ip(gb::text(r->network_ip));
+    e->set_network_port(r->network_port);
+    e->set_user_agent(gb::text(r->user_agent));
+    e->set_call_id(gb::text(r->call_id));
+    e->set_resync(r->resync != 0);
     return s->send(std::move(m));
   } catch (...) {
     return GB_ERR_INTERNAL;
