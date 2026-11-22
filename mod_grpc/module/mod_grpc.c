@@ -2451,8 +2451,9 @@ static void *SWITCH_THREAD_FUNC acl_reload_thread(switch_thread_t *thread, void 
  *   sofia::unregister (2214-2227): from-user, from-host, contact, call-id, network-ip, network-port, user-agent, realm
  *                                  (sofia.c:2080 socket-disconnection variant: from-user, from-host, call-id only)
  *   sofia::expire     (726-738):   user, host, contact, call-id, expires, user-agent, realm, network-ip, network-port
- * `show registrations as json` (mod_commands.c:5831, table at switch_core_sqldb.c:2978): {"row_count":N,"rows":[
- *   {reg_user, realm, token, url, expires (absolute epoch), network_ip, network_port, network_proto, hostname, metadata}]}.
+ * Resync source (confirmed live): `sofia xmlstatus` lists <profile><name/><type>profile|alias</type>, and
+ *   `sofia xmlstatus profile <p> reg` gives <registration> with call-id, user (user@domain), contact (raw Contact
+ *   header), agent, status ("... expsecs(n)"), host (the node), network-ip, network-port.
  * ponytail: tenant_for(NULL, domain) may make an engine CONFIG lookup (up to 1500 ms) on the event dispatch thread;
  * the bridge caches the answer, so only the first REGISTER per domain pays. */
 static int reg_send(int type, const char *user, const char *domain, const char *contact, int32_t expires_s,
@@ -2508,50 +2509,81 @@ static void reg_event_handler(switch_event_t *event)
 			 switch_event_get_header(event, "call-id"), 0);
 }
 
-static const char *reg_jstr(cJSON *row, const char *k)
+/* The output of an API command (malloc'd, the caller frees it), or NULL. */
+static char *reg_api(const char *cmd, const char *args)
 {
-	cJSON *v = cJSON_GetObjectItem(row, k);
-	return v && cJSON_IsString(v) ? v->valuestring : NULL;
+	switch_stream_handle_t stream = { 0 };
+	SWITCH_STANDARD_STREAM(stream);
+	if (switch_api_execute(cmd, args, NULL, &stream) != SWITCH_STATUS_SUCCESS || zstr((char *) stream.data)) {
+		switch_safe_free(stream.data);
+		return NULL;
+	}
+	return (char *) stream.data;
+}
+
+static switch_xml_t reg_api_xml(const char *args)
+{
+	char *out = reg_api("sofia", args);
+	switch_xml_t x = out ? switch_xml_parse_str_dup(out) : NULL;
+	free(out);
+	return x;
+}
+
+static const char *reg_xstr(switch_xml_t x, const char *k)
+{
+	switch_xml_t c = switch_xml_child(x, k);
+	return c && !zstr(c->txt) ? c->txt : NULL;
 }
 
 #define REG_SEND_TRIES 20     /* x REG_SEND_WAIT_US = 1 s of patience per row before giving up and retrying the replay */
 #define REG_SEND_WAIT_US 50000
+/* Replays this node's registrations from sofia itself (spec 5.3), so a replayed RegEvent carries what the live event
+ * carries: the raw Contact, the user agent, the call-id. Rows are kept only when <host> is this node, in case
+ * profiles share a registration database. expires_s comes from sofia's expsecs(n), which includes sofia's late
+ * margin on top of the phone's Expires: a replayed expires_s may run up to that margin long. */
 static void reg_resync(void)
 {
-	switch_stream_handle_t stream = { 0 };
-	cJSON *j, *rows, *row;
 	const char *me = switch_core_get_switchname();
-	time_t now = time(NULL);
+	switch_xml_t profiles = reg_api_xml("xmlstatus"), p;
 	int rc = GB_OK, failed = 0, tries;
 	unsigned unsent = 0;
 
-	SWITCH_STANDARD_STREAM(stream);
-	if (switch_api_execute("show", "registrations as json", NULL, &stream) == SWITCH_STATUS_SUCCESS && stream.data &&
-		(j = cJSON_Parse((const char *) stream.data))) {
-		rows = cJSON_GetObjectItem(j, "rows");
-		cJSON_ArrayForEach(row, rows) {
-			const char *host = reg_jstr(row, "hostname"), *exp = reg_jstr(row, "expires");
-			long left = exp ? atol(exp) - (long) now : 0;
-			if (zstr(host) || strcmp(host, me)) continue;
+	if (!profiles) return;
+	for (p = switch_xml_child(profiles, "profile"); p; p = p->next) {
+		const char *name = reg_xstr(p, "name"), *type = reg_xstr(p, "type");
+		char args[300];
+		switch_xml_t x, regs, r;
+		if (!name || !type || strcmp(type, "profile") || strlen(name) > 200) continue; /* aliases repeat a profile */
+		switch_snprintf(args, sizeof args, "xmlstatus profile %s reg", name);
+		if (!(x = reg_api_xml(args))) continue;
+		regs = switch_xml_child(x, "registrations");
+		for (r = regs ? switch_xml_child(regs, "registration") : NULL; r; r = r->next) {
+			const char *host = reg_xstr(r, "host"), *aor = reg_xstr(r, "user"), *st = reg_xstr(r, "status"), *es;
+			char user[256], *domain;
+			long left = 0;
+			if (!host || strcmp(host, me) || !aor || strlen(aor) >= sizeof user) continue;
+			switch_snprintf(user, sizeof user, "%s", aor);
+			if (!(domain = strchr(user, '@'))) continue;
+			*domain++ = 0;
 			if (failed) { unsent++; continue; }
+			if (st && (es = strstr(st, "expsecs("))) left = atol(es + 8);
 			for (tries = 0; tries < REG_SEND_TRIES; tries++) {
-				rc = reg_send(GB_REG_REGISTER, reg_jstr(row, "reg_user"), reg_jstr(row, "realm"), reg_jstr(row, "url"),
-					 left < 1 ? 1 : (int32_t) left, reg_jstr(row, "network_ip"), reg_jstr(row, "network_port"),
-					 reg_jstr(row, "metadata"), reg_jstr(row, "token"), 1);
+				rc = reg_send(GB_REG_REGISTER, user, domain, reg_xstr(r, "contact"), left < 1 ? 1 : (int32_t) left,
+							  reg_xstr(r, "network-ip"), reg_xstr(r, "network-port"), reg_xstr(r, "agent"), reg_xstr(r, "call-id"), 1);
 				if (rc != GB_ERR_QUEUE_FULL) break;
 				switch_yield(REG_SEND_WAIT_US); /* the send queue is bounded: let the stream drain */
 			}
 			if (rc != GB_OK) { failed = 1; unsent++; }
 		}
-		if (failed) {
-			switch_mutex_lock(globals.state_mutex);
-			globals.reg_resync_pending = 1; /* the next tick replays everything again */
-			switch_mutex_unlock(globals.state_mutex);
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "registration resync incomplete (rc=%d): %u registrations not sent, will retry\n", rc, unsent);
-		}
-		cJSON_Delete(j);
+		switch_xml_free(x);
 	}
-	switch_safe_free(stream.data);
+	switch_xml_free(profiles);
+	if (failed) {
+		switch_mutex_lock(globals.state_mutex);
+		globals.reg_resync_pending = 1; /* the next tick replays everything again */
+		switch_mutex_unlock(globals.state_mutex);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "registration resync incomplete (rc=%d): %u registrations not sent, will retry\n", rc, unsent);
+	}
 }
 
 static void *SWITCH_THREAD_FUNC reg_resync_thread(switch_thread_t *thread, void *obj)
