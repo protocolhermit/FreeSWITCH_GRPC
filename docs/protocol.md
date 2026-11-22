@@ -24,7 +24,7 @@ string. An empty `tenant_id` means a node-level request, for example a domain
 
 ```proto
 message NodeMessage   { string request_id = 1; oneof body { Hello, Heartbeat, LookupRequest, RouteRequest,
-                                                            CallEvent, CommandResult, StepResult, ConfEvent } }
+                                                            CallEvent, CommandResult, StepResult, ConfEvent, RegEvent } }
 message EngineMessage { string request_id = 1; oneof body { HelloAck, LookupResponse, Invalidate,
                                                             RouteResponse, Command, TokenRotate } }
 ```
@@ -38,7 +38,7 @@ message EngineMessage { string request_id = 1; oneof body { HelloAck, LookupResp
 | `LookupRequest` | `LookupResponse` (same `request_id`) | request/response |
 | `RouteRequest` | `RouteResponse` (same `request_id`) | request/response |
 | `StepResult` | `RouteResponse` (same `request_id`): the next batch | request/response |
-| `Heartbeat`, `CallEvent`, `ConfEvent` | nothing | fire-and-forget |
+| `Heartbeat`, `CallEvent`, `ConfEvent`, `RegEvent` | nothing | fire-and-forget |
 | `CommandResult` | nothing (it *is* the reply to an engine `Command`) | ack |
 
 | Engine sends unprompted | Node does |
@@ -59,7 +59,8 @@ timeouts are:
 ## 2. Handshake and liveness
 
 ```proto
-message Hello    { string node_id; string version; string token; repeated string tags; int32 capacity; string boot_id; }
+message Hello    { string node_id; string version; string token; repeated string tags; int32 capacity; string boot_id;
+                    string sip_address; string registration_mode; }
 message HelloAck { bool accepted; string reason; string session_id; int32 heartbeat_interval_s; }
 message Heartbeat{ int32 active_calls; int32 cpu_pct; int64 ts_unix_ms; }
 ```
@@ -76,6 +77,10 @@ message Heartbeat{ int32 active_calls; int32 cpu_pct; int64 ts_unix_ms; }
   process restarted, so drop any calls you believed were on that node. An
   empty `boot_id` means the build doesn't report one. Don't treat it as a
   restart.
+- `sip_address` (7) is the `host:port` peers dial to reach this node's SIP
+  profile (the `sip-address` setting). Empty when unset.
+- `registration_mode` (8) is `"local"` or `"engine"`. It is **empty in `edge`
+  mode**, so an edge node's `Hello` is unchanged.
 - `heartbeat_interval_s` sets how often the node sends `Heartbeat`. `0` means
   every 5 s.
 
@@ -96,11 +101,23 @@ payloads:
 | kind | tenant_id | key | payload the module expects |
 |------|-----------|-----|---------------------------|
 | `CONFIG` | `""` | `domain:<fqdn lowercased>` | `{"tenant_id":"<uuid>"}`: which tenant owns the domain |
-| `DIRECTORY` | tenant | `user@domain` | `{"name":"Alice"}` (`found=false` rejects the user) |
+| `DIRECTORY` | tenant | `user@domain` | `{"name":"Alice"}` (`found=false` rejects the user). Optional: `a1_hash`, `password`, `vars` (below). |
 | `CONFIG` | tenant | `survival` | Survival snapshot (see below) |
 | `XML` | tenant or `""` | `dialplan/<context>` | A FreeSWITCH XML document for that context |
 | `XML` | `""` | `configuration/<name>.conf` | A FreeSWITCH configuration document |
 | `DIALPLAN`, other `CONFIG` | tenant | your choice | Free-form. You can test it with `grpc lookup`. |
+
+Directory JSON fields:
+
+| Field | Type | Effect |
+|-------|------|--------|
+| `name` | string | Caller-ID name. Defaults to the user. |
+| `a1_hash` | string | `md5(user:domain:password)`, set as the `a1-hash` param. Preferred. |
+| `password` | string | `password` param. Used only when `a1_hash` is absent. |
+| `vars` | object of strings | User variables, filtered by `var-allow`. `tenant_id` is never overridable. At most 32. |
+
+`a1_hash`, `password`, and the sofia `dial-string` param are applied only when
+`directory-auth` is on (the default in `local` and `engine` mode).
 
 Survival snapshot:
 
@@ -218,7 +235,7 @@ There are two ways a command arrives:
 | Action | Fields | Effect |
 |--------|--------|--------|
 | `Originate` | `dial_string`, `vars`, `timeout_s`, `route_on_answer` | Places a new call. The leg carries `X-Tenant-Id`. With `route_on_answer`, the answered leg comes back to you as a fresh `RouteRequest` (domain `dialer.invalid`, identified by `dialer_token`) instead of being parked. |
-| `Bridge` | `uuid`, `dial_string`, `timeout_s`, `peer_tenant_id`, `peer_caller_id` | Bridges the call to a dial string |
+| `Bridge` | `uuid`, `dial_string`, `timeout_s`, `peer_tenant_id`, `peer_caller_id`, `peer_addresses`, `peer_target` | Bridges the call to a dial string. See "Peer legs" below. |
 | `BridgeLegs` | `uuid_a`, `uuid_b` | Bridges two existing legs |
 | `Park` | `uuid` | Parks the call |
 | `Playback` | `uuid`, `file` | Plays a file or stream |
@@ -234,6 +251,31 @@ There are two ways a command arrives:
 | `SuperviseMode` | `uuid`, `mode` | Switches the eavesdrop mode |
 | `Announce` | `uuid`, `prompt`, `leg_only` | Plays a prompt to one or both legs |
 | `Drain` | `deadline_s` | Stops accepting new inbound calls |
+
+### Peer legs (`engine` mode)
+
+`Bridge.peer_addresses` (6, `repeated string`) lists `host:port` SIP addresses
+of nodes that hold the callee's registrations. `Bridge.peer_target` (7) is
+`user@domain` for the hop legs. `dial_string` may be empty when the callee has
+no local device.
+
+The node rings `dial_string` and one hop leg per address together. Each hop leg
+is `[sip_h_X-Tenant-Id=<tenant>,sip_h_X-Grpc-Hop=1]sofia/<peer-profile>/<peer_target>;fs_path=sip:<host:port>`.
+The module adds both headers itself.
+
+The node refuses the `Bridge` (the result carries an `error`) when:
+
+- `registration-mode` is not `engine`
+- the channel already carries `X-Grpc-Hop` (no second hop)
+- `peer_tenant_id` is also set
+- `dial_string` contains `|`
+- an address is not `host:port` (host `[A-Za-z0-9.-]`, port 1..65535, no IPv6)
+- `peer_target` is not exactly `user@domain`
+
+A hop leg that reaches another node sends a `RouteRequest` with
+`vars["hop"]="1"`. The module sets `hop` only in `engine` mode, when
+`X-Grpc-Hop` is present and its `X-Tenant-Id` was trusted. The engine must then
+bridge to local devices only.
 
 ## 6. Events
 
@@ -253,6 +295,34 @@ message ConfEvent { Type type /* RECORDING_DONE | ROOM_READY */; string tenant; 
 
 `ConfEvent RECORDING_DONE` reports a conference recording that
 `ConferenceControl` started, including whether its upload succeeded.
+
+### Registrations
+
+```proto
+message RegEvent { Type type /* REGISTER=1 | UNREGISTER=2 | EXPIRE=3 */; string tenant_id; string user; string domain;
+                   string contact; int32 expires_s; string network_ip; int32 network_port;
+                   string user_agent; string call_id; bool resync; }
+```
+
+Sent only in `engine` mode, as `NodeMessage.reg_event` (field 10).
+Fire-and-forget, no reply.
+
+| Field | Meaning |
+|-------|---------|
+| `type` | `REGISTER` (also a refresh), `UNREGISTER`, or `EXPIRE`. |
+| `tenant_id` | Tenant of the domain (resolved as in user-guide §3). |
+| `user`, `domain` | The address of record. |
+| `contact` | The raw Contact header. It may carry a display name. |
+| `expires_s` | Seconds until the registration expires. |
+| `network_ip`, `network_port`, `user_agent` | Where the phone registered from. |
+| `call_id` | The REGISTER's Call-ID: one device. Use it to match an unregister to its register. |
+| `resync` | `true` on a replay after the node reconnects to the engine. |
+
+After every reconnect the node replays the live registrations on its profiles
+with `resync=true`. A replayed `expires_s` may exceed the phone's `Expires` by
+up to sofia's late margin. A replay can also re-add a device that unregistered
+while the replay ran, so a live `UNREGISTER` (`resync=false`) should win over an
+older `resync` `REGISTER` for the same `call_id`.
 
 ## 7. Token rotation
 

@@ -25,7 +25,7 @@ On each `Connect` stream:
    - `LookupRequest` → `LookupResponse`, echoing `request_id`
    - `RouteRequest` → `RouteResponse`, echoing `request_id`
    - `StepResult` → `RouteResponse` with the next batch, echoing `request_id`
-   - `Heartbeat` / `CallEvent` / `ConfEvent` → record them, no reply
+   - `Heartbeat` / `CallEvent` / `ConfEvent` / `RegEvent` → record them, no reply
    - `CommandResult` → match it to a `Command` you sent, by `command_id`
 3. **Push** `Command`, `Invalidate`, and `TokenRotate` whenever you need to.
    Keep a registry `node_id → stream` so other parts of your system can reach
@@ -364,3 +364,147 @@ The node rejects a command with an `error` (visible in `StepResult.error` or
 **Transfer**
 
 - `token` must be UUID-shaped.
+
+---
+
+## 8. Registrations and multi-node routing
+
+This section applies to nodes running `registration-mode=engine` (see
+[user-guide.md](user-guide.md) §9). The phones register on the nodes, and the
+engine learns about it from `RegEvent`s. It then decides which node to ring.
+Nodes in `edge` or `local` mode send no `RegEvent`.
+
+### What the engine receives
+
+- `Hello.sip_address`: the `host:port` other nodes dial. Keep it per `node_id`.
+- `Hello.registration_mode`: `"engine"`.
+- `RegEvent` with `type` `REGISTER`, `UNREGISTER`, or `EXPIRE`, one per
+  change. The node also replays its live registrations after every reconnect,
+  with `resync=true` (see [protocol.md](protocol.md) §6).
+
+### Store: one Redis hash per user
+
+Key `reg:{tenant}:{user}@{domain}`. One field per `call_id` (one per device),
+holding JSON:
+
+```json
+{"node_id":"fs-01","sip_address":"10.0.0.11:5080","contact":"<sip:1001@10.1.2.3:5060>","expires_at":1763900000}
+```
+
+- `REGISTER`: `HSET` the field, then `HEXPIRE` that field for `expires_s`
+  seconds. A device that vanishes disappears on its own.
+- `UNREGISTER` and `EXPIRE`: `HDEL` the field.
+- Treat `expires_s` as a TTL, not an exact time. A replayed value can run up to
+  about a minute longer than the phone's `Expires`.
+- Per-field `HEXPIRE` needs **Redis 7.4 or newer**. On older Redis, use one key
+  per device, `reg:{tenant}:{user}@{domain}:{call_id}`, with `SET ... EX`, plus a
+  set `regs:{tenant}:{user}@{domain}` of those keys. Read the set, then fetch
+  each key and drop members whose key is gone.
+
+### Two rules for replays
+
+- **A live `UNREGISTER` wins.** A replay is a snapshot, and it can add a
+  device that unregistered while it ran. Remember each unregistered `call_id`
+  for a couple of minutes, and ignore a `resync` `REGISTER` for it.
+- **A changed `Hello.boot_id` means that node restarted.** Delete every
+  registration you hold for its `node_id` before accepting the new stream's
+  events. The node's replay then fills them in again. Do the same when a node
+  is gone for good.
+
+### Routing a call to a registered user
+
+On `RouteRequest` for `user@domain`, read the hash and group the devices by
+`node_id`. The node that sent the request is the **local** one.
+
+| Case | Answer |
+|------|--------|
+| Device on this node only | `Bridge{DialString: "user/<user>@<domain>"}` |
+| Devices on other nodes | `Bridge{PeerAddresses: <sip_address of each>, PeerTarget: "<user>@<domain>"}` and a `DialString` for local devices (empty if none) |
+| `vars["hop"] == "1"` | The call already hopped from another node. Use **local devices only**, with no `PeerAddresses`. The node refuses a second hop. |
+
+### Ring strategies
+
+Chosen by the engine, per tenant, with an optional per-user override. The node
+doesn't know about them.
+
+| Strategy | Rings |
+|----------|-------|
+| `all` | Every device on every node, together. |
+| `last-registered` | The device with the latest registration only. |
+| `local-first` | Devices on this node. Peers only if none is local. |
+
+### A `RegEvent` handler in Go
+
+Uses `github.com/redis/go-redis/v9` (`HSet`, `HExpire`, `HDel`, `HGetAll`;
+`HExpire` needs v9.6 or newer and Redis 7.4). I did not compile it against a
+live Redis.
+
+```go
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	pb "example.com/engine/gen/controlplane/v1"
+)
+
+type regInfo struct {
+	NodeID     string `json:"node_id"`
+	SipAddress string `json:"sip_address"`
+	Contact    string `json:"contact"`
+	ExpiresAt  int64  `json:"expires_at"`
+}
+
+func regKey(r *pb.RegEvent) string { return "reg:" + r.TenantId + ":" + r.User + "@" + r.Domain }
+
+// In the Recv loop: case *pb.NodeMessage_RegEvent: go e.onReg(ctx, n, b.RegEvent)
+func (e *engine) onReg(ctx context.Context, n *node, r *pb.RegEvent) {
+	key := regKey(r)
+	switch r.Type {
+	case pb.RegEvent_REGISTER:
+		if r.Resync && e.rdb.Exists(ctx, "unreg:"+r.CallId).Val() > 0 {
+			return // a live UNREGISTER already won
+		}
+		v, _ := json.Marshal(regInfo{n.id, n.sipAddress, r.Contact, time.Now().Unix() + int64(r.ExpiresS)})
+		e.rdb.HSet(ctx, key, r.CallId, v)
+		e.rdb.HExpire(ctx, key, time.Duration(r.ExpiresS)*time.Second, r.CallId)
+		e.rdb.SAdd(ctx, "node:"+n.id, key+"|"+r.CallId) // so a restart can drop them
+	case pb.RegEvent_UNREGISTER, pb.RegEvent_EXPIRE:
+		e.rdb.HDel(ctx, key, r.CallId)
+		e.rdb.SRem(ctx, "node:"+n.id, key+"|"+r.CallId)
+		if r.Type == pb.RegEvent_UNREGISTER && !r.Resync {
+			e.rdb.Set(ctx, "unreg:"+r.CallId, 1, 2*time.Minute)
+		}
+	}
+}
+
+// Call when a node's Hello carries a different boot_id than the last one seen for it.
+func (e *engine) dropNode(ctx context.Context, nodeID string) {
+	for _, m := range e.rdb.SMembers(ctx, "node:"+nodeID).Val() {
+		i := strings.LastIndex(m, "|")
+		e.rdb.HDel(ctx, m[:i], m[i+1:])
+	}
+	e.rdb.Del(ctx, "node:"+nodeID)
+}
+
+// Devices of a user, for route(): grouped by node by the caller.
+func (e *engine) devices(ctx context.Context, tenant, user, domain string) []regInfo {
+	var out []regInfo
+	for _, v := range e.rdb.HGetAll(ctx, "reg:"+tenant+":"+user+"@"+domain).Val() {
+		var ri regInfo
+		if json.Unmarshal([]byte(v), &ri) == nil {
+			out = append(out, ri)
+		}
+	}
+	return out
+}
+```
+
+The snippet needs `rdb *redis.Client` on `engine`, `sipAddress string` on
+`node` (set from `h.SipAddress` in `Connect`). Call `dropNode` from `Connect`
+when `h.BootId` differs from the one last stored for that node. The `node:<id>`
+set can hold stale members after an `HEXPIRE` expiry. `HDel` on a missing field
+does nothing, so that is harmless.

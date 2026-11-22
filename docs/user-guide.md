@@ -14,6 +14,8 @@ SIP edge (e.g. Kamailio) ──SIP──▶ FreeSWITCH + mod_grpc ══gRPC str
 - One FreeSWITCH node opens exactly **one** `Connect` stream to the engine.
 - Everything (lookups, routing, events, commands) is multiplexed on that stream.
 - The module is multi-tenant: every request carries a `tenant_id` (a UUID).
+- A SIP edge is optional. Without Kamailio, the node can take phone
+  registrations itself. See §9.
 
 See [protocol.md](protocol.md) for the wire contract and
 [building-an-engine.md](building-an-engine.md) to write the server side.
@@ -123,6 +125,14 @@ Add `<load module="mod_grpc"/>` to `modules.conf.xml`, or run `load mod_grpc` fr
 | `survival-dial-format` | – | Needed with `survival`: dial string with exactly two `%s` (number, domain), e.g. `sofia/internal/%s@%s`. |
 | `survival-refresh` | `300` | Seconds between snapshot refreshes. |
 | `survival-max-age` | `86400` | Seconds a snapshot may be served without an engine. |
+| `registration-mode` | `edge` | `edge`: a SIP edge (Kamailio) holds registrations and sets `X-Tenant-Id`. `local`: this node's sofia holds registrations, the tenant comes from the domain. `engine`: like `local`, and the node also reports registrations to the engine. See §9. |
+| `tenancy` | `multi` | `multi`: tenant per call. `single`: every call, lookup, and directory entry uses `default-tenant`. |
+| `default-tenant` | – | Tenant UUID. Required with `tenancy=single`. |
+| `tenant-header-acl` | – | FreeSWITCH ACL list the SIP source must pass for its `X-Tenant-Id` to be trusted. In `local` and `engine` mode no header is trusted without it. In `edge` mode it is optional: unset trusts the header, as before. The list is not checked at load beyond a warning (FreeSWITCH can't tell a missing list from a denied address). |
+| `directory-auth` | on in `local`/`engine`, off in `edge` | Put `a1_hash` or `password` from the engine's directory answer into the user entry, so sofia can challenge. |
+| `peer-profile` | `internal` | Sofia profile used for peer hop legs (`[A-Za-z0-9_-]+`). |
+| `sip-address` | – | `host:port` peers dial to reach this node. **Required** in `engine` mode; sent in `Hello`. |
+| `<domain-tenants>` | – | A block next to `<settings>`: `<domain name="acme.example" tenant="<uuid>"/>`. Maps a domain to a tenant without asking the engine. Used in `local` mode only. |
 
 The module **refuses to load** in these cases:
 
@@ -131,6 +141,11 @@ The module **refuses to load** in these cases:
 - only one of `tls-cert` and `tls-key` is set
 - an allow-list names a command that is never permitted
 - `survival` is on with a bad `survival-dial-format`
+- `registration-mode` is not `edge`, `local`, or `engine`, or `tenancy` is not `single` or `multi`
+- `tenancy=single` without a UUID `default-tenant`
+- a `<domain>` in `<domain-tenants>` has no name or no UUID tenant
+- `peer-profile` has characters outside `[A-Za-z0-9_-]`
+- `registration-mode=engine` without `sip-address`
 
 Check the FreeSWITCH log for the reason.
 
@@ -150,7 +165,8 @@ Use the `grpc_route` dialplan application:
 
 `grpc_route` does the following:
 
-1. **Finds the tenant.** It reads the SIP header `X-Tenant-Id`
+1. **Finds the tenant.** The order depends on the mode (table below). In the
+   default `edge` mode it reads the SIP header `X-Tenant-Id`
    (`sip_h_X-Tenant-Id`), set by your SIP edge, or the `tenant_id` channel
    variable. If neither is set, it asks the engine which tenant owns the call's
    domain (a `CONFIG` lookup of `domain:<fqdn>`).
@@ -164,6 +180,22 @@ Use the `grpc_route` dialplan application:
 5. Hangs up with `NORMAL_TEMPORARY_FAILURE` if the engine is unreachable,
    says `unavailable`, or returns no commands. With survival on, it tries
    survival routing first.
+
+Tenant resolution, first match wins:
+
+| Mode | Order | No match |
+|------|-------|----------|
+| `edge` | `X-Tenant-Id` header (trusted unless `tenant-header-acl` is set and the source fails it), `tenant_id` variable, engine domain lookup | `tenant_id=""`, as before |
+| `local` | header (UUID, and only if the source passes `tenant-header-acl`), `tenant_id` variable (UUID), `<domain-tenants>` map, engine domain lookup | call rejected |
+| `engine` | same as `local`, without the map | call rejected |
+| any, `tenancy=single` | `default-tenant`, always | – |
+
+A rejected call logs `no tenant for domain …`, hangs up with
+`NORMAL_TEMPORARY_FAILURE`, and sends no `RouteRequest`.
+
+An `X-Tenant-Id` that is not trusted is removed from the channel, counted in
+`untrusted_tenant_headers` (see `grpc status`), and neither used nor forwarded.
+The XML dialplan fetch does not use it either.
 
 The routing timeout is 3 s. Step reports are retried up to 6 times, 1 s apart,
 and retrying is safe.
@@ -181,6 +213,17 @@ The module answers FreeSWITCH `directory` lookups from the engine
 `{"name": "Alice"}`. The module builds the user entry with these variables:
 `tenant_id`, `user_context=default`, `effective_caller_id_number`, and
 `effective_caller_id_name`.
+
+With `directory-auth` on, the JSON can also carry:
+
+| Field | Effect |
+|-------|--------|
+| `a1_hash` | Becomes the `a1-hash` param: `md5(user:domain:password)`. Preferred, so the engine never sends a clear password. |
+| `password` | Becomes the `password` param. Used only when there is no `a1_hash`. |
+| `vars` | Object of strings, set as user variables. Only names listed in `var-allow` are kept, and `tenant_id` can never be overridden. At most 32. |
+
+In `local` and `engine` mode the entry also gets a `dial-string` domain param,
+so `user/<n>@<domain>` dials the user's registered contact.
 
 ### Events
 
@@ -203,14 +246,19 @@ channel that has a `tenant_id`:
 | `grpc cache flush` | Empties the lookup cache. |
 | `grpc xml` | Shows the XML-fetch sections, mode, served and rejected counts, the last rejection, and the ACL reload state. |
 | `grpc survival <tenant>` | Shows whether a survival snapshot is ready. |
+| `grpc tenant <domain>` | Shows which tenant a domain resolves to and where it came from, as `tenant=<uuid or -> source=<none, default, map, or engine>`. It uses no channel, so a header or variable never counts here. |
 | `grpc undrain` | Accepts new inbound calls again after an engine `Drain`. |
 
 Example:
 
 ```
 freeswitch> grpc status
-node=fs-01 endpoints=engine1:9443 connected=yes draining=no cache_entries=12 hits=340 stale_served=0 invalidated=3 survival=off last="session 7f3c..."
+node=fs-01 endpoints=engine1:9443 connected=yes draining=no cache_entries=12 hits=340 stale_served=0 invalidated=3 survival=off last="session 7f3c..." mode=edge tenancy=multi untrusted_tenant_headers=0
 ```
+
+`mode`, `tenancy`, and `untrusted_tenant_headers` are always shown. In `engine`
+mode the line also ends with `reg_events_sent=<n> reg_resync_last=<unix time or never>`:
+registration events sent, and when the last replay after a reconnect ran.
 
 ---
 
@@ -269,3 +317,87 @@ Callers on those calls hear `unavailable-prompt`, then the call hangs up.
 - `ApiBatch` is limited to the `api-allow`, `api-headers`, `xml-app-allow`,
   and `var-allow` lists. Some commands are never allowed, whatever the config
   says.
+
+---
+
+## 9. Running without Kamailio
+
+By default a SIP edge such as Kamailio holds phone registrations and tells the
+node the tenant in `X-Tenant-Id`. With `registration-mode=local` or `engine`,
+the FreeSWITCH node does both itself.
+
+| Mode | Registrations | Tenant | Multi-node |
+|------|---------------|--------|------------|
+| `edge` | at the edge | `X-Tenant-Id` from the edge | the edge routes |
+| `local` | in this node's sofia | from the domain (§3) | none: a user reachable on one node only |
+| `engine` | in this node's sofia, and reported to the engine as `RegEvent` | from the domain (§3) | the engine knows which node holds each device and answers a `Bridge` with `peer_addresses` |
+
+Use `engine` when a user's phone may be registered on any of several nodes.
+The engine side is in
+[building-an-engine.md](building-an-engine.md) §8.
+
+### Node settings (`engine` mode)
+
+```xml
+<param name="registration-mode" value="engine"/>
+<param name="tenancy"           value="multi"/>
+<param name="tenant-header-acl" value="peers"/>
+<param name="sip-address"       value="10.0.0.11:5080"/>
+```
+
+`peers` is a FreeSWITCH ACL listing the other nodes (`acl.conf`):
+
+```xml
+<list name="peers" default="deny">
+  <node type="allow" cidr="10.0.0.11/32"/>
+  <node type="allow" cidr="10.0.0.12/32"/>
+</list>
+```
+
+`local` mode needs no `sip-address`. Single-tenant installs set `tenancy=single`
+and `default-tenant`. Local mode can map domains without the engine:
+
+```xml
+<domain-tenants>
+  <domain name="acme.example" tenant="6f1c2a8e-3b7d-4c11-9a0e-2d5f6b7c8d90"/>
+</domain-tenants>
+```
+
+### Sofia profile (`local` and `engine`)
+
+On the profile that phones register on (usually `internal`):
+
+| Param | Value | Why |
+|-------|-------|-----|
+| `disable-register` | `false` | Accept registrations. |
+| `auth-calls` | `true` | Challenge calls from phones. |
+| `challenge-realm` | `auto_from` | Digest uses the SIP domain as realm, so `a1_hash` is `md5(user:domain:password)`. Without it an INVITE is challenged with the node's IP as realm and fails. REGISTER works either way. |
+| `apply-inbound-acl` | the `peers` list | Peers calling in with a hop leg skip the digest challenge. Phones are not on the list, so they are still challenged. |
+
+Peers must be on **both** lists: sofia `apply-inbound-acl` (so the hop leg is
+accepted) and mod_grpc `tenant-header-acl` (so its `X-Tenant-Id` is trusted).
+Add the dialplan in §3 to the profile's context.
+
+Registration data lives in each node's sofia memory. A shared ODBC database
+between nodes is **not** supported: every node would see every other node's
+registrations as its own.
+
+### What the node does in `engine` mode
+
+- **Registrations.** `sofia::register`, `sofia::unregister`, and `sofia::expire`
+  become `RegEvent`s. After the engine stream reconnects, the node replays
+  its live registrations (from `sofia xmlstatus`) with `resync=true`.
+- **Peer legs.** A `Bridge` with `peer_addresses` and `peer_target` rings the
+  local device and each listed node together. Each hop leg is
+  `sofia/<peer-profile>/<user@domain>;fs_path=sip:<host:port>` with `X-Tenant-Id` and
+  `X-Grpc-Hop=1` added by the module. `fs_path` has no angle brackets: the
+  bracket form loses the user and domain on FreeSWITCH 1.11.
+- **Loop guard.** A hop that arrives with `X-Grpc-Hop` from a trusted peer
+  reaches the engine as `RouteRequest.vars["hop"]="1"`. The engine must route it
+  to local devices only. The node also refuses a peer `Bridge` on such a call.
+
+### Limits
+
+- A caller that offers only L16 (for example an `originate` on `loopback/`) can't use the peer hop: the peer answers 488. Real SIP callers can. Test the hop from a SIP phone or a second FreeSWITCH.
+- A replayed `expires_s` may be longer than the phone's real `Expires` by up to sofia's late margin (about a minute). The engine should treat `expires_s` as a TTL.
+- IPv6 peer addresses are refused.

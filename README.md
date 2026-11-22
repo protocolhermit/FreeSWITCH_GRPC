@@ -9,7 +9,9 @@ control **engine** over one bidirectional gRPC stream. The engine handles:
 - configuration
 - live call control
 
-Calls, conferences, recordings, and supervision are multi-tenant.
+Calls, conferences, recordings, and supervision are multi-tenant. The module
+runs behind a SIP edge such as Kamailio or on its own, with phones registering
+on the FreeSWITCH nodes.
 
 | Path | Contents |
 |------|----------|
