@@ -75,6 +75,12 @@ static struct {
 	const char *var_allow;
 	const char *route_vars; /* extra channel variables sent on RouteRequest and StepResult; "" = none */
 	int reg_mode;                 /* TN_MODE_*: registration-mode */
+	/* engine mode: sofia registrations forwarded to the engine. All but the handles are under state_mutex. */
+	switch_event_node_t *reg_nodes[3];
+	switch_thread_t *reg_thread;
+	int reg_resync_pending;       /* the stream (re)connected: replay every live registration */
+	unsigned reg_events_sent;
+	time_t reg_resync_last;       /* 0 = never */
 	int tenancy_single;           /* tenancy=single: every call gets default-tenant */
 	const char *default_tenant;
 	const char *tenant_header_acl; /* NULL: sip_h_X-Tenant-Id is trusted in edge mode */
@@ -509,6 +515,7 @@ static void cb_state(void *ud, int connected, const char *reason)
 	switch_mutex_lock(globals.state_mutex);
 	switch_snprintf(globals.last_reason, sizeof(globals.last_reason), "%s", reason);
 	if (connected) globals.acl_pending = 1; /* FreeSWITCH loaded acl.conf before this module existed */
+	if (connected && globals.reg_mode == TN_MODE_ENGINE) globals.reg_resync_pending = 1; /* flag only: no gb_* in a callback */
 	switch_mutex_unlock(globals.state_mutex);
 	switch_log_printf(SWITCH_CHANNEL_LOG, connected ? SWITCH_LOG_NOTICE : SWITCH_LOG_WARNING, "engine stream %s: %s\n",
 					  connected ? "up" : "down", reason);
@@ -2114,6 +2121,16 @@ SWITCH_STANDARD_API(grpc_api)
 							   (unsigned) st.stale_served, (unsigned) st.invalidated, globals.survival ? "on" : "off", reason,
 							   globals.reg_mode == TN_MODE_LOCAL ? "local" : globals.reg_mode == TN_MODE_ENGINE ? "engine" : "edge",
 							   globals.tenancy_single ? "single" : "multi", untrusted);
+		if (globals.reg_mode == TN_MODE_ENGINE) {
+			unsigned sent;
+			time_t last;
+			switch_mutex_lock(globals.state_mutex);
+			sent = globals.reg_events_sent;
+			last = globals.reg_resync_last;
+			switch_mutex_unlock(globals.state_mutex);
+			if (last) stream->write_function(stream, "reg_events_sent=%u reg_resync_last=%lld\n", sent, (long long) last);
+			else stream->write_function(stream, "reg_events_sent=%u reg_resync_last=never\n", sent);
+		}
 	} else if (!strcasecmp(argv[0], "undrain") && argc == 1) {
 		undrain();
 		stream->write_function(stream, "+OK\n");
@@ -2432,6 +2449,117 @@ static void *SWITCH_THREAD_FUNC acl_reload_thread(switch_thread_t *thread, void 
 	return NULL;
 }
 
+/* Sofia registration events, engine mode. Header names confirmed in FreeSWITCH source
+ * (src/mod/endpoints/mod_sofia/sofia_reg.c):
+ *   sofia::register   (2060-2078): from-user, from-host, contact, call-id, expires (seconds, relative), network-ip,
+ *                                  network-port, user-agent, realm
+ *   sofia::unregister (2214-2227): from-user, from-host, contact, call-id, network-ip, network-port, user-agent, realm
+ *                                  (sofia.c:2080 socket-disconnection variant: from-user, from-host, call-id only)
+ *   sofia::expire     (726-738):   user, host, contact, call-id, expires, user-agent, realm, network-ip, network-port
+ * `show registrations as json` (mod_commands.c:5831, table at switch_core_sqldb.c:2978): {"row_count":N,"rows":[
+ *   {reg_user, realm, token, url, expires (absolute epoch), network_ip, network_port, network_proto, hostname, metadata}]}.
+ * ponytail: tenant_for(NULL, domain) may make an engine CONFIG lookup (up to 1500 ms) on the event dispatch thread;
+ * the bridge caches the answer, so only the first REGISTER per domain pays. */
+static void reg_send(int type, const char *user, const char *domain, const char *contact, int32_t expires_s,
+					 const char *ip, const char *port, const char *ua, const char *call_id, int resync)
+{
+	gb_reg_event_t e;
+	char tenant[64];
+	int rc;
+
+	if (zstr(user) || zstr(domain)) return;
+	if (tenant_for(NULL, domain, tenant, sizeof(tenant)) == TN_SRC_NONE) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "registration %s@%s: no tenant, not forwarded\n", user, domain);
+		return;
+	}
+	memset(&e, 0, sizeof e);
+	e.type = type;
+	e.tenant_id = tenant;
+	e.user = user;
+	e.domain = domain;
+	e.contact = contact ? contact : "";
+	e.expires_s = expires_s;
+	e.network_ip = ip ? ip : "";
+	e.network_port = port ? atoi(port) : 0;
+	e.user_agent = ua ? ua : "";
+	e.call_id = call_id ? call_id : "";
+	e.resync = resync;
+	rc = gb_send_reg_event(globals.bridge, &e);
+	if (rc == GB_OK) {
+		switch_mutex_lock(globals.state_mutex);
+		globals.reg_events_sent++;
+		switch_mutex_unlock(globals.state_mutex);
+	} /* GB_ERR_DISCONNECTED: the resync after the reconnect replays it */
+}
+
+static void reg_event_handler(switch_event_t *event)
+{
+	const char *sub = switch_event_get_header(event, "Event-Subclass");
+	const char *user, *domain, *exp;
+	int type;
+
+	if (zstr(sub)) return;
+	if (!strcmp(sub, "sofia::register")) type = GB_REG_REGISTER;
+	else if (!strcmp(sub, "sofia::unregister")) type = GB_REG_UNREGISTER;
+	else if (!strcmp(sub, "sofia::expire")) type = GB_REG_EXPIRE;
+	else return;
+	user = switch_event_get_header(event, type == GB_REG_EXPIRE ? "user" : "from-user");
+	domain = switch_event_get_header(event, type == GB_REG_EXPIRE ? "host" : "from-host");
+	exp = switch_event_get_header(event, "expires");
+	reg_send(type, user, domain, switch_event_get_header(event, "contact"),
+			 type == GB_REG_REGISTER && exp ? atoi(exp) : 0, switch_event_get_header(event, "network-ip"),
+			 switch_event_get_header(event, "network-port"), switch_event_get_header(event, "user-agent"),
+			 switch_event_get_header(event, "call-id"), 0);
+}
+
+static const char *reg_jstr(cJSON *row, const char *k)
+{
+	cJSON *v = cJSON_GetObjectItem(row, k);
+	return v && cJSON_IsString(v) ? v->valuestring : NULL;
+}
+
+static void reg_resync(void)
+{
+	switch_stream_handle_t stream = { 0 };
+	cJSON *j, *rows, *row;
+	const char *me = switch_core_get_switchname();
+	time_t now = time(NULL);
+
+	SWITCH_STANDARD_STREAM(stream);
+	if (switch_api_execute("show", "registrations as json", NULL, &stream) == SWITCH_STATUS_SUCCESS && stream.data &&
+		(j = cJSON_Parse((const char *) stream.data))) {
+		rows = cJSON_GetObjectItem(j, "rows");
+		cJSON_ArrayForEach(row, rows) {
+			const char *host = reg_jstr(row, "hostname"), *exp = reg_jstr(row, "expires");
+			long left = exp ? atol(exp) - (long) now : 0;
+			if (zstr(host) || strcmp(host, me)) continue;
+			reg_send(GB_REG_REGISTER, reg_jstr(row, "reg_user"), reg_jstr(row, "realm"), reg_jstr(row, "url"),
+					 left < 1 ? 1 : (int32_t) left, reg_jstr(row, "network_ip"), reg_jstr(row, "network_port"),
+					 reg_jstr(row, "metadata"), reg_jstr(row, "token"), 1);
+		}
+		cJSON_Delete(j);
+	}
+	switch_safe_free(stream.data);
+}
+
+static void *SWITCH_THREAD_FUNC reg_resync_thread(switch_thread_t *thread, void *obj)
+{
+	while (!globals.acl_stop) {
+		int pending;
+		switch_yield(ACL_TICK_US);
+		switch_mutex_lock(globals.state_mutex);
+		pending = globals.reg_resync_pending;
+		switch_mutex_unlock(globals.state_mutex);
+		if (!pending || !gb_connected(globals.bridge)) continue;
+		switch_mutex_lock(globals.state_mutex);
+		globals.reg_resync_pending = 0; /* cleared before sending: a reconnect during the replay asks for another */
+		globals.reg_resync_last = time(NULL);
+		switch_mutex_unlock(globals.state_mutex);
+		reg_resync();
+	}
+	return NULL;
+}
+
 SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
 {
 	switch_xml_t cfg, xml, settings, param;
@@ -2673,6 +2801,18 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "cannot start the ACL reload thread: the engine's acl.conf will only load on a manual reloadacl\n");
 		}
 	}
+	if (globals.reg_mode == TN_MODE_ENGINE) {
+		static const char *const subs[3] = { "sofia::register", "sofia::unregister", "sofia::expire" };
+		switch_threadattr_t *attr = NULL;
+		for (i = 0; i < 3; i++)
+			if (switch_event_bind_removable(modname, SWITCH_EVENT_CUSTOM, subs[i], reg_event_handler, NULL, &globals.reg_nodes[i]) != SWITCH_STATUS_SUCCESS)
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "cannot bind %s: registrations of that kind will not reach the engine\n", subs[i]);
+		switch_threadattr_create(&attr, pool);
+		if (switch_thread_create(&globals.reg_thread, attr, reg_resync_thread, NULL, pool) != SWITCH_STATUS_SUCCESS) {
+			globals.reg_thread = NULL;
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "cannot start the registration resync thread\n");
+		}
+	}
 	gb_start(globals.bridge);
 	return SWITCH_STATUS_SUCCESS;
 }
@@ -2687,11 +2827,16 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_grpc_shutdown)
 	if (globals.dp_binding) switch_xml_unbind_search_function(&globals.dp_binding);
 	if (globals.xml_binding) switch_xml_unbind_search_function(&globals.xml_binding);
 	for (i = 0; i < globals.nnodes; i++) switch_event_unbind(&globals.nodes[i]);
+	for (i = 0; i < 3; i++) if (globals.reg_nodes[i]) { switch_event_unbind(&globals.reg_nodes[i]); globals.reg_nodes[i] = NULL; }
 	globals.acl_stop = 1;
 	if (globals.bridge) gb_stop(globals.bridge); /* no callback fires after this */
 	if (globals.acl_thread) { /* after gb_stop: a fetch in progress returns at once on a stopped bridge */
 		switch_thread_join(&st, globals.acl_thread);
 		globals.acl_thread = NULL;
+	}
+	if (globals.reg_thread) {
+		switch_thread_join(&st, globals.reg_thread);
+		globals.reg_thread = NULL;
 	}
 	if (globals.cmdq) {
 		switch_queue_push(globals.cmdq, NULL); /* wake the command thread */
