@@ -26,6 +26,7 @@
 #include "xml_fetch.h"
 #include "tenant.h"
 #include "directory_xml.h"
+#include "peer_leg.h"
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load);
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_grpc_shutdown);
@@ -110,6 +111,8 @@ typedef struct {
 	int type, conf_action, timeout_s, deadline_s, mode, leg_only, route_on_answer, max_len_s;
 	char **keys, **values;
 	size_t nvars;
+	char **peers, *peer_target; /* engine-mode peer hop legs; peers may be NULL while npeers > 0 after a failed allocation: pl_build refuses that */
+	size_t npeers;
 } cmd_item_t;
 
 static char *dupz(const char *s) { return strdup(s ? s : ""); }
@@ -140,6 +143,11 @@ static cmd_item_t *cmd_dup(const gb_command_t *c)
 	o->mode = c->mode;
 	o->leg_only = c->leg_only;
 	o->route_on_answer = c->route_on_answer;
+	o->peer_target = dupz(c->peer_target);
+	o->npeers = c->npeer_addresses;
+	if (o->npeers && (o->peers = calloc(o->npeers, sizeof(char *)))) {
+		for (i = 0; i < o->npeers; i++) o->peers[i] = dupz(c->peer_addresses[i]); /* a NULL entry becomes "", which pl_addr_ok refuses */
+	}
 	if (c->nvars) {
 		o->keys = calloc(c->nvars, sizeof(char *));
 		o->values = calloc(c->nvars, sizeof(char *));
@@ -164,6 +172,8 @@ static void cmd_free(cmd_item_t *o)
 	free(o->target_uuid); free(o->token); free(o->room); free(o->rec_id); free(o->upload_url);
 	for (i = 0; i < o->nvars; i++) { free(o->keys[i]); free(o->values[i]); }
 	free(o->keys); free(o->values);
+	for (i = 0; i < o->npeers && o->peers; i++) free(o->peers[i]);
+	free(o->peers); free(o->peer_target);
 	free(o);
 }
 
@@ -195,6 +205,24 @@ static switch_bool_t run_conference_api(const char *args, char *err, size_t errl
 
 static switch_bool_t safe_value(const char *v) { return dg_safe_value(v) ? SWITCH_TRUE : SWITCH_FALSE; }
 static switch_bool_t safe_dial(const char *v, const char *tenant) { return dg_safe_dial(v, tenant) ? SWITCH_TRUE : SWITCH_FALSE; }
+
+#define PEER_DIAL_MAX 1024
+/* Engine-mode bridge through peer nodes (spec 5.5): local devices plus one hop leg per peer. Only a call that has not
+ * already hopped may hop again; a peer bridge identity is not combined with hop legs. */
+static switch_bool_t peer_dial(switch_channel_t *channel, const char *local, char *const *peers, size_t npeers, const char *target,
+							   const char *tenant, const char *peer_tenant, char *out, size_t outlen, char *err, size_t errlen)
+{
+	if (globals.reg_mode != TN_MODE_ENGINE) {
+		switch_snprintf(err, errlen, "bridge: peer legs need registration-mode=engine");
+		return SWITCH_FALSE;
+	}
+	if (!zstr(peer_tenant) || !pl_build(local, (const char *const *) peers, npeers, globals.peer_profile, target, tenant,
+										!zstr(switch_channel_get_variable(channel, "sip_h_X-Grpc-Hop")), out, outlen)) {
+		switch_snprintf(err, errlen, "bridge: peer hop refused");
+		return SWITCH_FALSE;
+	}
+	return SWITCH_TRUE;
+}
 
 /* A command that names a call must name the tenant that owns the channel. */
 static switch_bool_t tenant_owns(const char *uuid, const char *tenant)
@@ -323,6 +351,7 @@ static switch_bool_t exec_conference_control(const cmd_item_t *c, char *err, siz
 static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 {
 	char args[2048];
+	char pdial[PEER_DIAL_MAX];
 	int ctl = 1;
 
 	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_CONFERENCE_CONTROL) {
@@ -355,8 +384,8 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 	}
 	switch (c->type) {
 	case GB_CMD_BRIDGE:
-		if (zstr(c->peer_tenant_id) ? !safe_dial(c->dial_string, c->tenant_id) :
-			!dg_safe_peer_bridge(c->dial_string, c->tenant_id, c->peer_tenant_id, c->peer_caller_id)) {
+		if (!c->npeers && (zstr(c->peer_tenant_id) ? !safe_dial(c->dial_string, c->tenant_id) :
+			!dg_safe_peer_bridge(c->dial_string, c->tenant_id, c->peer_tenant_id, c->peer_caller_id))) {
 			switch_snprintf(err, errlen, "bridge: bad dial string");
 			return SWITCH_FALSE;
 		}
@@ -369,6 +398,10 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 				switch_core_session_rwunlock(target);
 				switch_snprintf(err, errlen, "no such call for this tenant"); return SWITCH_FALSE;
 			}
+			if (c->npeers && !peer_dial(channel, c->dial_string, c->peers, c->npeers, c->peer_target, c->tenant_id, c->peer_tenant_id, pdial, sizeof(pdial), err, errlen)) {
+				switch_core_session_rwunlock(target);
+				return SWITCH_FALSE;
+			}
 			bridge_identity(channel, c->peer_tenant_id, c->peer_caller_id);
 			switch_core_session_rwunlock(target);
 		}
@@ -376,7 +409,7 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 			switch_snprintf(args, sizeof(args), "%s call_timeout=%d", c->uuid, c->timeout_s);
 			run_api("uuid_setvar", args, err, errlen);
 		}
-		switch_snprintf(args, sizeof(args), "%s bridge::%s aleg", c->uuid, c->dial_string);
+		switch_snprintf(args, sizeof(args), "%s bridge::%s aleg", c->uuid, c->npeers ? pdial : c->dial_string);
 		return run_api("uuid_broadcast", args, err, errlen);
 	case GB_CMD_PARK:
 		return run_api("uuid_park", c->uuid, err, errlen);
@@ -1530,6 +1563,8 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 	switch_channel_t *channel = switch_core_session_get_channel(session);
 	const char *mine = switch_core_session_get_uuid(session);
 	char err[256] = "";
+	char pdial[PEER_DIAL_MAX];
+	const char *dial = c->dial_string;
 	switch_bool_t ok = SWITCH_TRUE;
 
 	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_AMD) { /* the bridge maps an unknown action to type 0 */
@@ -1548,11 +1583,18 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 		/* Command ownership must match the channel; only an explicit peer grant permits a different SIP stamp. */
 		if (zstr(c->tenant_id) || zstr(switch_channel_get_variable(channel, "tenant_id")) ||
 			strcmp(c->tenant_id, switch_channel_get_variable(channel, "tenant_id")) ||
-			(zstr(c->peer_tenant_id) ? !safe_dial(c->dial_string, c->tenant_id) :
-			 !dg_safe_peer_bridge(c->dial_string, c->tenant_id, c->peer_tenant_id, c->peer_caller_id))) {
+			(!c->npeer_addresses && (zstr(c->peer_tenant_id) ? !safe_dial(c->dial_string, c->tenant_id) :
+			 !dg_safe_peer_bridge(c->dial_string, c->tenant_id, c->peer_tenant_id, c->peer_caller_id)))) {
 			switch_snprintf(err, sizeof(err), "bridge: bad dial string");
 			ok = SWITCH_FALSE;
 			break;
+		}
+		if (c->npeer_addresses) {
+			if (!peer_dial(channel, c->dial_string, (char *const *) c->peer_addresses, c->npeer_addresses, c->peer_target, c->tenant_id, c->peer_tenant_id, pdial, sizeof(pdial), err, sizeof(err))) {
+				ok = SWITCH_FALSE;
+				break;
+			}
+			dial = pdial;
 		}
 		if (c->timeout_s > 0) switch_channel_set_variable_printf(channel, "call_timeout", "%d", c->timeout_s);
 		if (!zstr(c->step_id)) { /* a flow drives this call: the bridge ending or failing must not end it */
@@ -1569,7 +1611,7 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 		t0 = switch_micro_time_now();
 		/* the far leg inherits the call's identity: its answer and hangup then reach the engine as call events */
 		bridge_identity(channel, c->peer_tenant_id, c->peer_caller_id);
-		switch_core_session_execute_application(session, "bridge", c->dial_string);
+		switch_core_session_execute_application(session, "bridge", dial);
 		bridge_outcome(channel, (switch_micro_time_now() - t0) / 1000000, oc);
 		break;
 	}
@@ -1949,10 +1991,12 @@ SWITCH_STANDARD_APP(grpc_route_function)
 	int rc;
 
 	char resolved[64] = "";
+	int tsrc;
 
 	call_id = call_id ? switch_core_session_strdup(session, call_id) : NULL;
 	domain = domain ? switch_core_session_strdup(session, domain) : NULL;
-	tenant = tenant_for(channel, domain, resolved, sizeof(resolved)) != TN_SRC_NONE ? switch_core_session_strdup(session, resolved) : NULL;
+	tsrc = tenant_for(channel, domain, resolved, sizeof(resolved));
+	tenant = tsrc != TN_SRC_NONE ? switch_core_session_strdup(session, resolved) : NULL;
 	if (zstr(tenant) && globals.reg_mode != TN_MODE_EDGE) { /* spec 5.2: no tenant outside edge means no call; edge sends tenant_id="" as before */
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "no tenant for domain %s: rejecting the call\n", zstr(domain) ? "-" : domain);
 		switch_channel_hangup(channel, SWITCH_CAUSE_NORMAL_TEMPORARY_FAILURE);
@@ -1978,6 +2022,11 @@ SWITCH_STANDARD_APP(grpc_route_function)
 			nh++;
 		}
 		if (first) switch_channel_variable_last(channel);
+	}
+	if (tsrc == TN_SRC_HEADER && !zstr(switch_channel_get_variable(channel, "sip_h_X-Grpc-Hop"))) { /* a hop from a peer node: the engine must not hop it again */
+		vars[nv].key = "hop";
+		vars[nv].value = "1";
+		nv++;
 	}
 	nv = add_route_vars(session, channel, vars, nv, sizeof(vars) / sizeof(*vars), 0);
 	memset(&req, 0, sizeof(req));
@@ -2553,6 +2602,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
 	}
 	switch_snprintf(version, sizeof(version), "%s", switch_version_full());
 	c.version = version;
+	c.sip_address = globals.sip_address;
+	c.registration_mode = globals.reg_mode == TN_MODE_LOCAL ? "local" : globals.reg_mode == TN_MODE_ENGINE ? "engine" : "edge";
 
 	cb.on_state = cb_state;
 	cb.on_command = cb_command;
