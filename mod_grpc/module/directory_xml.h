@@ -61,7 +61,6 @@ static inline int dx_user_xml(const dx_user_t *u, char *out, size_t outlen)
 {
 	dx_buf_t b = {out, outlen, 1};
 	size_t i;
-	int params = 0;
 	if (!u || !out || !outlen || !u->domain || !u->user || !u->tenant) return 0;
 	dx_raw(&b, "<document type=\"freeswitch/xml\"><section name=\"directory\"><domain name=\"");
 	dx_esc(&b, u->domain);
@@ -72,13 +71,16 @@ static inline int dx_user_xml(const dx_user_t *u, char *out, size_t outlen)
 		dx_raw(&b, "\"/></params>");
 	}
 	dx_attr(&b, "<user id=\"", u->user, "\">");
-	if (u->with_auth && ((u->a1_hash && *u->a1_hash) || (u->password && *u->password))) {
+	if (u->with_auth) {
+		dx_raw(&b, "<params>");
 		/* a1-hash wins: the engine never has to send the clear password */
-		if (u->a1_hash && *u->a1_hash) dx_attr(&b, "<params><param name=\"a1-hash\" value=\"", u->a1_hash, "\"/></params>");
-		else dx_attr(&b, "<params><param name=\"password\" value=\"", u->password, "\"/></params>");
-		params = 1;
+		if (u->a1_hash && *u->a1_hash) dx_attr(&b, "<param name=\"a1-hash\" value=\"", u->a1_hash, "\"/>");
+		else if (u->password && *u->password) dx_attr(&b, "<param name=\"password\" value=\"", u->password, "\"/>");
+		/* sofia's allow-empty-password defaults to true: a user without credentials would accept any password */
+		dx_raw(&b, "<param name=\"allow-empty-password\" value=\"false\"/></params>");
+	} else {
+		dx_raw(&b, "<params/>");
 	}
-	if (!params) dx_raw(&b, "<params/>");
 	dx_raw(&b, "<variables>");
 	dx_attr(&b, "<variable name=\"tenant_id\" value=\"", u->tenant, "\"/>");
 	dx_raw(&b, "<variable name=\"user_context\" value=\"default\"/>");

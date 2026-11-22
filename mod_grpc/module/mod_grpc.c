@@ -80,6 +80,8 @@ static struct {
 	switch_thread_t *reg_thread;
 	int reg_resync_pending;       /* the stream (re)connected: replay every live registration */
 	unsigned reg_events_sent;
+	unsigned reg_events_dropped;  /* live RegEvents lost on a full send queue (state_mutex) */
+	time_t reg_drop_warned;
 	time_t reg_resync_last;       /* 0 = never */
 	int tenancy_single;           /* tenancy=single: every call gets default-tenant */
 	const char *default_tenant;
@@ -725,7 +727,6 @@ static switch_xml_t directory_search(const char *section, const char *tag_name, 
 	const char *domain, *user, *given;
 	char tenant[64] = "", lookup_key[300];
 	gb_lookup_result_t r;
-	switch_stream_handle_t xml = { 0 };
 	switch_xml_t result = NULL;
 	cJSON *j;
 
@@ -734,7 +735,9 @@ static switch_xml_t directory_search(const char *section, const char *tag_name, 
 	user = switch_event_get_header(params, "user");
 	if (zstr(domain) || zstr(user) || strlen(domain) + strlen(user) > 250) return NULL;
 	given = switch_event_get_header(params, "tenant_id");
-	if (!zstr(given) && strlen(given) < sizeof(tenant)) switch_snprintf(tenant, sizeof(tenant), "%s", given);
+	/* outside edge only a tenant id is taken from the caller of the directory; anything else resolves by domain */
+	if (!zstr(given) && strlen(given) < sizeof(tenant) && (globals.reg_mode == TN_MODE_EDGE || dg_uuid_shaped(given)))
+		switch_snprintf(tenant, sizeof(tenant), "%s", given);
 	else if (tenant_for(NULL, domain, tenant, sizeof(tenant)) == TN_SRC_NONE) return NULL;
 
 	switch_snprintf(lookup_key, sizeof(lookup_key), "%s@%s", user, domain);
@@ -2110,14 +2113,16 @@ SWITCH_STANDARD_API(grpc_api)
 		gb_cache_stats_t st;
 		char reason[256];
 		unsigned untrusted;
-		char regs[96] = ""; /* engine mode only: edge output stays byte-identical */
+		char regs[160] = ""; /* the reg counters are engine-mode only; mode, tenancy and untrusted_tenant_headers print in every mode */
 		gb_cache_stats(globals.bridge, &st);
 		switch_mutex_lock(globals.state_mutex);
 		untrusted = globals.untrusted_headers;
 		switch_snprintf(reason, sizeof(reason), "%s", globals.last_reason);
 		if (globals.reg_mode == TN_MODE_ENGINE) {
-			if (globals.reg_resync_last) switch_snprintf(regs, sizeof(regs), " reg_events_sent=%u reg_resync_last=%lld", globals.reg_events_sent, (long long) globals.reg_resync_last);
-			else switch_snprintf(regs, sizeof(regs), " reg_events_sent=%u reg_resync_last=never", globals.reg_events_sent);
+			char last[32] = "never";
+			if (globals.reg_resync_last) switch_snprintf(last, sizeof(last), "%lld", (long long) globals.reg_resync_last);
+			switch_snprintf(regs, sizeof(regs), " reg_events_sent=%u reg_events_dropped=%u reg_resync_last=%s", globals.reg_events_sent,
+							globals.reg_events_dropped, last);
 		}
 		switch_mutex_unlock(globals.state_mutex);
 		stream->write_function(stream, "node=%s endpoints=%s connected=%s draining=%s cache_entries=%u hits=%u stale_served=%u invalidated=%u survival=%s last=\"%s\" mode=%s tenancy=%s untrusted_tenant_headers=%u%s\n",
@@ -2485,7 +2490,21 @@ static int reg_send(int type, const char *user, const char *domain, const char *
 		switch_mutex_lock(globals.state_mutex);
 		globals.reg_events_sent++;
 		switch_mutex_unlock(globals.state_mutex);
-	} /* live event lost on GB_ERR_DISCONNECTED or GB_ERR_QUEUE_FULL: the resync replays it only after a reconnect */
+	} else if (rc == GB_ERR_QUEUE_FULL && !resync) {
+		/* a live event lost on a full queue: count it and ask for a replay, which restores lost REGISTERs (a lost
+		 * UNREGISTER/EXPIRE is not replayed: the engine keeps that device until its expiry). The replay itself retries
+		 * on a full queue and is not counted here. A loss on GB_ERR_DISCONNECTED is covered by the resync on reconnect. */
+		unsigned dropped;
+		int warn = 0;
+		time_t now = time(NULL);
+		switch_mutex_lock(globals.state_mutex);
+		dropped = ++globals.reg_events_dropped;
+		globals.reg_resync_pending = 1;
+		if (now - globals.reg_drop_warned >= 10) { globals.reg_drop_warned = now; warn = 1; }
+		switch_mutex_unlock(globals.state_mutex);
+		if (warn)
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "registration event for %s@%s dropped (send queue full, %u dropped so far): a resync is scheduled\n", user, domain, dropped);
+	}
 	return rc;
 }
 
@@ -2734,11 +2753,18 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_grpc: registration-mode=engine needs sip-address (host:port peers dial); refusing to load\n");
 		return SWITCH_STATUS_TERM;
 	}
+	if (globals.reg_mode == TN_MODE_ENGINE && !pl_addr_ok(globals.sip_address)) { /* peers dial it as fs_path=sip:<it> */
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_grpc: sip-address must be host:port (IPv4 or name); refusing to load\n");
+		return SWITCH_STATUS_TERM;
+	}
 	/* ponytail: FreeSWITCH cannot tell an unknown ACL from a denied address (both false), so an unknown list is only a warning */
 	if (!zstr(globals.tenant_header_acl) && !switch_check_network_list_ip("127.0.0.1", globals.tenant_header_acl))
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "mod_grpc: tenant-header-acl %s denies 127.0.0.1 or does not exist; if it does not exist no tenant header is trusted in local/engine mode\n", globals.tenant_header_acl);
 	if (zstr(globals.peer_profile)) globals.peer_profile = "internal";
 	globals.directory_auth = dir_auth_set >= 0 ? dir_auth_set : (globals.reg_mode != TN_MODE_EDGE);
+	if (globals.reg_mode != TN_MODE_EDGE && !globals.directory_auth)
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "mod_grpc: registration-mode=%s with directory-auth=false: sofia has no credentials to challenge with\n",
+						  globals.reg_mode == TN_MODE_LOCAL ? "local" : "engine");
 	if (!globals.api_allow) globals.api_allow = "uuid_setvar,uuid_transfer,uuid_broadcast,originate";
 	if (!globals.api_headers) globals.api_headers = "";
 	if (!globals.xml_app_allow) globals.xml_app_allow = "answer,set,export,playback,bridge,transfer,hangup,sleep";

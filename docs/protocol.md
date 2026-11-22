@@ -116,8 +116,13 @@ Directory JSON fields:
 | `password` | string | `password` param. Used only when `a1_hash` is absent. |
 | `vars` | object of strings | User variables, filtered by `var-allow`. `tenant_id` is never overridable. At most 32. |
 
-`a1_hash`, `password`, and the sofia `dial-string` param are applied only when
-`directory-auth` is on (the default in `local` and `engine` mode).
+`a1_hash` and `password` are applied only when `directory-auth` is on (the
+default in `local` and `engine` mode). With `directory-auth` on, the user entry
+always carries `allow-empty-password=false`: a user the engine returns without
+`a1_hash` or `password` can't register or authenticate a call at all, with any
+password. (sofia's own default would accept any password for such a user.)
+The sofia `dial-string` domain param is added whenever `registration-mode` is
+not `edge`, whatever `directory-auth` says.
 
 Survival snapshot:
 
@@ -323,6 +328,11 @@ with `resync=true`. A replayed `expires_s` may exceed the phone's `Expires` by
 up to sofia's late margin. A replay can also re-add a device that unregistered
 while the replay ran, so a live `UNREGISTER` (`resync=false`) should win over an
 older `resync` `REGISTER` for the same `call_id`.
+
+`RegEvent` is fire-and-forget. A live event that finds the node's send queue
+full is lost, counted as `reg_events_dropped` in `grpc status`, and a replay is
+scheduled. The replay restores a lost `REGISTER`. A lost `UNREGISTER` or
+`EXPIRE` is not replayed, so that device stays until its `expires_s` runs out.
 
 ## 7. Token rotation
 

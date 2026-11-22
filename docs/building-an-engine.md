@@ -422,6 +422,11 @@ On `RouteRequest` for `user@domain`, read the hash and group the devices by
 | Devices on other nodes | `Bridge{PeerAddresses: <sip_address of each>, PeerTarget: "<user>@<domain>"}` and a `DialString` for local devices (empty if none) |
 | `vars["hop"] == "1"` | The call already hopped from another node. Use **local devices only**, with no `PeerAddresses`. The node refuses a second hop. |
 
+Trust only the `hop` var for this. The node sets it only when the hop came from
+a source that passed `tenant-header-acl`. The request may also carry the
+caller's headers as `sip_h_X-*` vars, including `sip_h_X-Grpc-Hop`, which any
+phone can send. Never treat that header var as a hop.
+
 ### Ring strategies
 
 Chosen by the engine, per tenant, with an optional per-user override. The node
@@ -436,8 +441,10 @@ doesn't know about them.
 ### A `RegEvent` handler in Go
 
 Uses `github.com/redis/go-redis/v9` (`HSet`, `HExpire`, `HDel`, `HGetAll`;
-`HExpire` needs v9.6 or newer and Redis 7.4). I did not compile it against a
-live Redis.
+`HExpire` needs v9.6 or newer and Redis 7.4). It is illustrative and was not
+compiled or run against a live Redis. The `unreg:<call_id>` tombstone and the
+`node:<id>` set are a suggestion beyond the spec: one way to let a live
+`UNREGISTER` win over a late replay, and to drop a restarted node's devices.
 
 ```go
 import (

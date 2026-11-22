@@ -128,10 +128,10 @@ Add `<load module="mod_grpc"/>` to `modules.conf.xml`, or run `load mod_grpc` fr
 | `registration-mode` | `edge` | `edge`: a SIP edge (Kamailio) holds registrations and sets `X-Tenant-Id`. `local`: this node's sofia holds registrations, the tenant comes from the domain. `engine`: like `local`, and the node also reports registrations to the engine. See §9. |
 | `tenancy` | `multi` | `multi`: tenant per call. `single`: every call, lookup, and directory entry uses `default-tenant`. |
 | `default-tenant` | – | Tenant UUID. Required with `tenancy=single`. |
-| `tenant-header-acl` | – | FreeSWITCH ACL list the SIP source must pass for its `X-Tenant-Id` to be trusted. In `local` and `engine` mode no header is trusted without it. In `edge` mode it is optional: unset trusts the header, as before. The list is not checked at load beyond a warning (FreeSWITCH can't tell a missing list from a denied address). |
-| `directory-auth` | on in `local`/`engine`, off in `edge` | Put `a1_hash` or `password` from the engine's directory answer into the user entry, so sofia can challenge. |
+| `tenant-header-acl` | – | FreeSWITCH ACL list the SIP source must pass for its `X-Tenant-Id` to be trusted. In `local` and `engine` mode no header is trusted without it. In `edge` mode it is optional: unset trusts the header, as before. The list is not checked at load beyond a warning (FreeSWITCH can't tell a missing list from a denied address). The check probes `127.0.0.1`, so a peers-only list (see §9) always logs this WARNING at load; that is expected. |
+| `directory-auth` | on in `local`/`engine`, off in `edge` | Put `a1_hash` or `password` from the engine's directory answer into the user entry, so sofia can challenge. When on, every user entry also gets `allow-empty-password=false`, so a user without credentials can't authenticate. Turning it off in `local`/`engine` mode logs a load-time WARNING: sofia then has no credentials to challenge with. |
 | `peer-profile` | `internal` | Sofia profile used for peer hop legs (`[A-Za-z0-9_-]+`). |
-| `sip-address` | – | `host:port` peers dial to reach this node. **Required** in `engine` mode; sent in `Hello`. |
+| `sip-address` | – | `host:port` peers dial to reach this node (host is an IPv4 address or a name, `[A-Za-z0-9.-]`). **Required** in `engine` mode, and the module refuses to load if it is not `host:port`. Sent in `Hello`. |
 | `<domain-tenants>` | – | A block next to `<settings>`: `<domain name="acme.example" tenant="<uuid>"/>`. Maps a domain to a tenant without asking the engine. Used in `local` mode only. |
 
 The module **refuses to load** in these cases:
@@ -220,6 +220,14 @@ With `directory-auth` on, the JSON can also carry:
 |-------|--------|
 | `a1_hash` | Becomes the `a1-hash` param: `md5(user:domain:password)`. Preferred, so the engine never sends a clear password. |
 | `password` | Becomes the `password` param. Used only when there is no `a1_hash`. |
+
+With `directory-auth` on, the entry always gets `allow-empty-password=false`. A
+user returned with neither `a1_hash` nor `password` therefore can't register or
+place an authenticated call. Without this, sofia would accept any password for
+that user, and the caller would get the user's `tenant_id`.
+
+| Field | Effect |
+|-------|--------|
 | `vars` | Object of strings, set as user variables. Only names listed in `var-allow` are kept, and `tenant_id` can never be overridden. At most 32. |
 
 In `local` and `engine` mode the entry also gets a `dial-string` domain param,
@@ -257,8 +265,9 @@ node=fs-01 endpoints=engine1:9443 connected=yes draining=no cache_entries=12 hit
 ```
 
 `mode`, `tenancy`, and `untrusted_tenant_headers` are always shown. In `engine`
-mode the line also ends with `reg_events_sent=<n> reg_resync_last=<unix time or never>`:
-registration events sent, and when the last replay after a reconnect ran.
+mode the line also ends with `reg_events_sent=<n> reg_events_dropped=<n> reg_resync_last=<unix time or never>`:
+registration events sent, live events lost because the send queue was full,
+and when the last replay ran.
 
 ---
 
@@ -345,7 +354,9 @@ The engine side is in
 <param name="sip-address"       value="10.0.0.11:5080"/>
 ```
 
-`peers` is a FreeSWITCH ACL listing the other nodes (`acl.conf`):
+`peers` is a FreeSWITCH ACL listing the other nodes (`acl.conf`). It doesn't
+list `127.0.0.1`, so the load-time WARNING "tenant-header-acl peers denies
+127.0.0.1 or does not exist" is expected here:
 
 ```xml
 <list name="peers" default="deny">
@@ -387,6 +398,10 @@ registrations as its own.
 - **Registrations.** `sofia::register`, `sofia::unregister`, and `sofia::expire`
   become `RegEvent`s. After the engine stream reconnects, the node replays
   its live registrations (from `sofia xmlstatus`) with `resync=true`.
+  A live event that finds the send queue full is dropped. The node counts it
+  (`reg_events_dropped`), logs a WARNING at most every 10 s, and schedules a
+  replay, which restores a lost `REGISTER`. A lost `UNREGISTER` or `EXPIRE` is
+  not replayed: the engine keeps that device until its `expires_s` runs out.
 - **Peer legs.** A `Bridge` with `peer_addresses` and `peer_target` rings the
   local device and each listed node together. Each hop leg is
   `sofia/<peer-profile>/<user@domain>;fs_path=sip:<host:port>` with `X-Tenant-Id` and
