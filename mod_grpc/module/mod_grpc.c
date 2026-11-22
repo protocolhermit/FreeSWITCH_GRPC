@@ -2110,27 +2110,22 @@ SWITCH_STANDARD_API(grpc_api)
 		gb_cache_stats_t st;
 		char reason[256];
 		unsigned untrusted;
+		char regs[96] = ""; /* engine mode only: edge output stays byte-identical */
 		gb_cache_stats(globals.bridge, &st);
 		switch_mutex_lock(globals.state_mutex);
 		untrusted = globals.untrusted_headers;
 		switch_snprintf(reason, sizeof(reason), "%s", globals.last_reason);
+		if (globals.reg_mode == TN_MODE_ENGINE) {
+			if (globals.reg_resync_last) switch_snprintf(regs, sizeof(regs), " reg_events_sent=%u reg_resync_last=%lld", globals.reg_events_sent, (long long) globals.reg_resync_last);
+			else switch_snprintf(regs, sizeof(regs), " reg_events_sent=%u reg_resync_last=never", globals.reg_events_sent);
+		}
 		switch_mutex_unlock(globals.state_mutex);
-		stream->write_function(stream, "node=%s endpoints=%s connected=%s draining=%s cache_entries=%u hits=%u stale_served=%u invalidated=%u survival=%s last=\"%s\" mode=%s tenancy=%s untrusted_tenant_headers=%u\n",
+		stream->write_function(stream, "node=%s endpoints=%s connected=%s draining=%s cache_entries=%u hits=%u stale_served=%u invalidated=%u survival=%s last=\"%s\" mode=%s tenancy=%s untrusted_tenant_headers=%u%s\n",
 							   globals.node_id, globals.endpoints, gb_connected(globals.bridge) ? "yes" : "no",
 							   globals.draining ? "yes" : "no", (unsigned) st.entries, (unsigned) st.hits,
 							   (unsigned) st.stale_served, (unsigned) st.invalidated, globals.survival ? "on" : "off", reason,
 							   globals.reg_mode == TN_MODE_LOCAL ? "local" : globals.reg_mode == TN_MODE_ENGINE ? "engine" : "edge",
-							   globals.tenancy_single ? "single" : "multi", untrusted);
-		if (globals.reg_mode == TN_MODE_ENGINE) {
-			unsigned sent;
-			time_t last;
-			switch_mutex_lock(globals.state_mutex);
-			sent = globals.reg_events_sent;
-			last = globals.reg_resync_last;
-			switch_mutex_unlock(globals.state_mutex);
-			if (last) stream->write_function(stream, "reg_events_sent=%u reg_resync_last=%lld\n", sent, (long long) last);
-			else stream->write_function(stream, "reg_events_sent=%u reg_resync_last=never\n", sent);
-		}
+							   globals.tenancy_single ? "single" : "multi", untrusted, regs);
 	} else if (!strcasecmp(argv[0], "undrain") && argc == 1) {
 		undrain();
 		stream->write_function(stream, "+OK\n");
@@ -2460,17 +2455,17 @@ static void *SWITCH_THREAD_FUNC acl_reload_thread(switch_thread_t *thread, void 
  *   {reg_user, realm, token, url, expires (absolute epoch), network_ip, network_port, network_proto, hostname, metadata}]}.
  * ponytail: tenant_for(NULL, domain) may make an engine CONFIG lookup (up to 1500 ms) on the event dispatch thread;
  * the bridge caches the answer, so only the first REGISTER per domain pays. */
-static void reg_send(int type, const char *user, const char *domain, const char *contact, int32_t expires_s,
+static int reg_send(int type, const char *user, const char *domain, const char *contact, int32_t expires_s,
 					 const char *ip, const char *port, const char *ua, const char *call_id, int resync)
 {
 	gb_reg_event_t e;
 	char tenant[64];
 	int rc;
 
-	if (zstr(user) || zstr(domain)) return;
+	if (zstr(user) || zstr(domain)) return GB_OK;
 	if (tenant_for(NULL, domain, tenant, sizeof(tenant)) == TN_SRC_NONE) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "registration %s@%s: no tenant, not forwarded\n", user, domain);
-		return;
+		return GB_OK;
 	}
 	memset(&e, 0, sizeof e);
 	e.type = type;
@@ -2489,7 +2484,8 @@ static void reg_send(int type, const char *user, const char *domain, const char 
 		switch_mutex_lock(globals.state_mutex);
 		globals.reg_events_sent++;
 		switch_mutex_unlock(globals.state_mutex);
-	} /* GB_ERR_DISCONNECTED: the resync after the reconnect replays it */
+	} /* live event lost on GB_ERR_DISCONNECTED or GB_ERR_QUEUE_FULL: the resync replays it only after a reconnect */
+	return rc;
 }
 
 static void reg_event_handler(switch_event_t *event)
@@ -2518,12 +2514,16 @@ static const char *reg_jstr(cJSON *row, const char *k)
 	return v && cJSON_IsString(v) ? v->valuestring : NULL;
 }
 
+#define REG_SEND_TRIES 20     /* x REG_SEND_WAIT_US = 1 s of patience per row before giving up and retrying the replay */
+#define REG_SEND_WAIT_US 50000
 static void reg_resync(void)
 {
 	switch_stream_handle_t stream = { 0 };
 	cJSON *j, *rows, *row;
 	const char *me = switch_core_get_switchname();
 	time_t now = time(NULL);
+	int rc = GB_OK, failed = 0, tries;
+	unsigned unsent = 0;
 
 	SWITCH_STANDARD_STREAM(stream);
 	if (switch_api_execute("show", "registrations as json", NULL, &stream) == SWITCH_STATUS_SUCCESS && stream.data &&
@@ -2533,9 +2533,21 @@ static void reg_resync(void)
 			const char *host = reg_jstr(row, "hostname"), *exp = reg_jstr(row, "expires");
 			long left = exp ? atol(exp) - (long) now : 0;
 			if (zstr(host) || strcmp(host, me)) continue;
-			reg_send(GB_REG_REGISTER, reg_jstr(row, "reg_user"), reg_jstr(row, "realm"), reg_jstr(row, "url"),
+			if (failed) { unsent++; continue; }
+			for (tries = 0; tries < REG_SEND_TRIES; tries++) {
+				rc = reg_send(GB_REG_REGISTER, reg_jstr(row, "reg_user"), reg_jstr(row, "realm"), reg_jstr(row, "url"),
 					 left < 1 ? 1 : (int32_t) left, reg_jstr(row, "network_ip"), reg_jstr(row, "network_port"),
 					 reg_jstr(row, "metadata"), reg_jstr(row, "token"), 1);
+				if (rc != GB_ERR_QUEUE_FULL) break;
+				switch_yield(REG_SEND_WAIT_US); /* the send queue is bounded: let the stream drain */
+			}
+			if (rc != GB_OK) { failed = 1; unsent++; }
+		}
+		if (failed) {
+			switch_mutex_lock(globals.state_mutex);
+			globals.reg_resync_pending = 1; /* the next tick replays everything again */
+			switch_mutex_unlock(globals.state_mutex);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "registration resync incomplete (rc=%d): %u registrations not sent, will retry\n", rc, unsent);
 		}
 		cJSON_Delete(j);
 	}
