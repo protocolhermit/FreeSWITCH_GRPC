@@ -956,7 +956,19 @@ static switch_bool_t media_local(const char *url, char *out, size_t outlen, char
 		switch_mutex_unlock(globals.state_mutex);
 		return SWITCH_TRUE;
 	}
-	if (switch_dir_make_recursive(globals.media_cache_dir, SWITCH_DEFAULT_DIR_PERMS, NULL) != SWITCH_STATUS_SUCCESS || !(sink.fp = fopen(tmp, "wb"))) {
+	{ /* switch_dir_make_recursive allocates from its pool: a short-lived one, never NULL */
+		switch_memory_pool_t *mp = NULL;
+		switch_status_t ds = SWITCH_STATUS_FALSE;
+		if (switch_core_new_memory_pool(&mp) == SWITCH_STATUS_SUCCESS) {
+			ds = switch_dir_make_recursive(globals.media_cache_dir, SWITCH_DEFAULT_DIR_PERMS, mp);
+			switch_core_destroy_memory_pool(&mp);
+		}
+		if (ds != SWITCH_STATUS_SUCCESS) {
+			switch_snprintf(err, errlen, "fetch: cache dir");
+			return SWITCH_FALSE;
+		}
+	}
+	if (!(sink.fp = fopen(tmp, "wb"))) {
 		switch_snprintf(err, errlen, "fetch: cache dir");
 		return SWITCH_FALSE;
 	}
