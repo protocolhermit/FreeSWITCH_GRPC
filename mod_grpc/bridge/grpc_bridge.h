@@ -143,6 +143,7 @@ typedef struct {
 	int32_t ms;                                 /* Sleep */
 	int beep;                                   /* Record */
 	const char *rec_id;     /* ConferenceControl: recording identifier */
+	const char *url; /* Playback url / Collect prompt_url */
 	const char *upload_url; /* Record/ConferenceControl: presigned PUT URL ("" = keep the file local) */
 	int mute;               /* Conference: join muted */
 	const char *target_uuid; /* Eavesdrop */

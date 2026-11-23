@@ -58,6 +58,7 @@ bool fill(const cp::Command& c, gb_command_t* o, const char* (*str)(const std::s
       o->type = GB_CMD_PLAYBACK;
       o->uuid = str(c.playback().uuid());
       o->file = str(c.playback().file());
+      o->url = str(c.playback().url());
       return true;
     case cp::Command::kHangup:
       o->type = GB_CMD_HANGUP;
@@ -72,6 +73,7 @@ bool fill(const cp::Command& c, gb_command_t* o, const char* (*str)(const std::s
       o->type = GB_CMD_COLLECT;
       o->uuid = str(c.collect().uuid());
       o->file = str(c.collect().prompt());
+      o->url = str(c.collect().prompt_url());
       o->min_digits = c.collect().min_digits();
       o->max_digits = c.collect().max_digits();
       o->timeout_ms = c.collect().timeout_ms();
@@ -348,6 +350,7 @@ void gb_route_result_free(gb_route_result_t* r) {
     std::free(const_cast<char*>(c.profile));
     std::free(const_cast<char*>(c.name));
     std::free(const_cast<char*>(c.upload_url));
+    std::free(const_cast<char*>(c.url));
     std::free(const_cast<char*>(c.rec_id));
     std::free(const_cast<char*>(c.target_uuid));
     std::free(const_cast<char*>(c.token));

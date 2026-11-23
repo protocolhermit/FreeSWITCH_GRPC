@@ -17,10 +17,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <utime.h>
 #include "grpc_bridge.h"
 #include "dial_guard.h"
 #include "survival.h"
 #include "step_guard.h"
+#include "media_fetch.h"
 #include "conference_recording.h"
 #include "api_guard.h"
 #include "data_api.h"
@@ -82,6 +84,10 @@ static struct {
 	int reg_resync_pending;       /* the stream (re)connected: replay every live registration */
 	unsigned reg_events_sent;
 	int data_timeout_ms;          /* data-timeout, default 1500 */
+	char *media_hosts, *media_cache_dir; /* media-hosts (empty = remote media off), media-cache-dir */
+	int64_t media_cache_max, media_max_bytes; /* media-cache-max, media-max-bytes */
+	int media_fetch_timeout_s;    /* media-fetch-timeout */
+	unsigned media_fetches, media_cache_hits; /* downloads done, and plays served from the cache (state_mutex) */
 	unsigned data_ops, data_errors; /* grpc data calls that reached the engine, and replies that were not +OK (state_mutex) */
 	unsigned reg_events_dropped;  /* live RegEvents lost on a full send queue (state_mutex) */
 	time_t reg_drop_warned;
@@ -118,7 +124,7 @@ static struct {
 
 typedef struct {
 	char *command_id, *tenant_id, *uuid, *dial_string, *file, *cause, *peer_tenant_id, *peer_caller_id;
-	char *target_uuid, *token, *room, *rec_id, *upload_url;
+	char *target_uuid, *token, *room, *rec_id, *upload_url, *url;
 	int type, conf_action, timeout_s, deadline_s, mode, leg_only, route_on_answer, max_len_s;
 	char **keys, **values;
 	size_t nvars;
@@ -146,6 +152,7 @@ static cmd_item_t *cmd_dup(const gb_command_t *c)
 	o->room = dupz(c->room);
 	o->rec_id = dupz(c->rec_id);
 	o->upload_url = dupz(c->upload_url);
+	o->url = dupz(c->url);
 	o->conf_action = c->conf_action;
 	o->max_len_s = c->max_len_s;
 	o->file = dupz(c->file);
@@ -174,7 +181,7 @@ static cmd_item_t *cmd_dup(const gb_command_t *c)
 	}
 	{ /* out of memory anywhere above: refuse the whole command rather than run one with a missing field */
 		int bad = !o->command_id || !o->tenant_id || !o->uuid || !o->dial_string || !o->peer_tenant_id || !o->peer_caller_id ||
-				  !o->target_uuid || !o->token || !o->room || !o->rec_id || !o->upload_url || !o->file || !o->cause ||
+				  !o->target_uuid || !o->token || !o->room || !o->rec_id || !o->upload_url || !o->url || !o->file || !o->cause ||
 				  !o->peer_target || (o->npeers && !o->peers) || o->nvars != c->nvars;
 		for (i = 0; !bad && i < o->npeers; i++) bad = !o->peers[i];
 		for (i = 0; !bad && i < o->nvars; i++) bad = !o->keys[i] || !o->values[i];
@@ -193,7 +200,7 @@ static void cmd_free(cmd_item_t *o)
 	free(o->command_id); free(o->tenant_id); free(o->uuid);
 	free(o->dial_string); free(o->file); free(o->cause);
 	free(o->peer_tenant_id); free(o->peer_caller_id);
-	free(o->target_uuid); free(o->token); free(o->room); free(o->rec_id); free(o->upload_url);
+	free(o->target_uuid); free(o->token); free(o->room); free(o->rec_id); free(o->upload_url); free(o->url);
 	for (i = 0; i < o->nvars; i++) { free(o->keys[i]); free(o->values[i]); }
 	free(o->keys); free(o->values);
 	for (i = 0; i < o->npeers && o->peers; i++) free(o->peers[i]);
@@ -442,6 +449,10 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 	case GB_CMD_PARK:
 		return run_api("uuid_park", c->uuid, err, errlen);
 	case GB_CMD_PLAYBACK:
+		if (!zstr(c->url)) {
+			switch_snprintf(err, errlen, "playback: url is inline only");
+			return SWITCH_FALSE;
+		}
 		if (!sg_safe_prompt(c->file, globals.record_dir, c->tenant_id)) { /* c->tenant_id owns the call (tenant_owns above) */
 			switch_snprintf(err, errlen, "playback: bad file");
 			return SWITCH_FALSE;
@@ -478,6 +489,10 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 		return run_api("uuid_recv_dtmf", args, err, errlen);
 	}
 	case GB_CMD_ANNOUNCE: {
+		if (!zstr(c->url)) {
+			switch_snprintf(err, errlen, "announce: url is inline only");
+			return SWITCH_FALSE;
+		}
 		if (!sg_safe_prompt(c->file, globals.record_dir, c->tenant_id) || !sg_broadcast_args(args, sizeof(args), c->uuid, c->file, c->leg_only)) {
 			switch_snprintf(err, errlen, "invalid announce prompt: %s", c->file);
 			return SWITCH_FALSE;
@@ -833,16 +848,139 @@ static const char *channel_tenant(switch_channel_t *channel)
 	return dg_uuid_shaped(t) ? t : NULL;
 }
 
+typedef struct { FILE *fp; int64_t n, max; int too_large; } media_sink_t;
+
+static size_t media_write(char *buf, size_t sz, size_t cnt, void *ud)
+{
+	media_sink_t *k = ud;
+	size_t len = sz * cnt;
+	if (k->n + (int64_t) len > k->max) { k->too_large = 1; return 0; }
+	k->n += (int64_t) len;
+	return fwrite(buf, 1, len, k->fp) == len ? len : 0;
+}
+
+/* Deletes the oldest cached files (by mtime) until the directory is within media-cache-max.
+ * ponytail: one directory scan per eviction, O(files) each; fine for thousands of files, an index is the upgrade. */
+static void media_evict(const char *dir)
+{
+	int pass;
+	for (pass = 0; pass < 64; pass++) {
+		DIR *d = opendir(dir);
+		struct dirent *e;
+		int64_t total = 0;
+		time_t oldest = 0;
+		char victim[1024] = "";
+		if (!d) return;
+		while ((e = readdir(d))) {
+			char p[1024];
+			struct stat st;
+			if (e->d_name[0] == '.' || strstr(e->d_name, ".tmp.")) continue;
+			if (snprintf(p, sizeof(p), "%s/%s", dir, e->d_name) >= (int) sizeof(p) || stat(p, &st) || !S_ISREG(st.st_mode)) continue;
+			total += st.st_size;
+			if (!victim[0] || st.st_mtime < oldest) { oldest = st.st_mtime; strcpy(victim, p); }
+		}
+		closedir(d);
+		if (total <= globals.media_cache_max || !victim[0]) return;
+		unlink(victim);
+	}
+}
+
+/* Fetched or cached local path for url in out; false with err set. Runs on the session thread (up to
+ * media-fetch-timeout seconds of silence for the caller). */
+static switch_bool_t media_local(const char *url, char *out, size_t outlen, char *err, size_t errlen)
+{
+	char name[40], tmp[1100];
+	struct stat st;
+	media_sink_t sink = { 0 };
+	CURL *cu;
+	CURLcode rc;
+	long code = 0;
+	if (zstr(globals.media_hosts)) {
+		switch_snprintf(err, errlen, "fetch: no media-hosts");
+		return SWITCH_FALSE;
+	}
+	if (!mf_url_ok(url, globals.media_hosts) || !mf_cache_name(url, name, sizeof(name))) {
+		switch_snprintf(err, errlen, "fetch: not allowed");
+		return SWITCH_FALSE;
+	}
+	if (snprintf(out, outlen, "%s/%s", globals.media_cache_dir, name) >= (int) outlen || snprintf(tmp, sizeof(tmp), "%s.tmp.%lu", out, (unsigned long) pthread_self()) >= (int) sizeof(tmp)) {
+		switch_snprintf(err, errlen, "fetch: cache dir");
+		return SWITCH_FALSE;
+	}
+	if (stat(out, &st) == 0 && S_ISREG(st.st_mode)) { /* hit: touch it so eviction keeps what is played */
+		utime(out, NULL);
+		switch_mutex_lock(globals.state_mutex);
+		globals.media_cache_hits++;
+		switch_mutex_unlock(globals.state_mutex);
+		return SWITCH_TRUE;
+	}
+	if (switch_dir_make_recursive(globals.media_cache_dir, SWITCH_DEFAULT_DIR_PERMS, NULL) != SWITCH_STATUS_SUCCESS || !(sink.fp = fopen(tmp, "wb"))) {
+		switch_snprintf(err, errlen, "fetch: cache dir");
+		return SWITCH_FALSE;
+	}
+	sink.max = globals.media_max_bytes;
+	cu = curl_easy_init();
+	if (!cu) {
+		fclose(sink.fp); unlink(tmp);
+		switch_snprintf(err, errlen, "fetch: init");
+		return SWITCH_FALSE;
+	}
+	curl_easy_setopt(cu, CURLOPT_URL, url);
+	curl_easy_setopt(cu, CURLOPT_FOLLOWLOCATION, 0L); /* a listed host must not bounce us to an unlisted one */
+	curl_easy_setopt(cu, CURLOPT_TIMEOUT, (long) globals.media_fetch_timeout_s);
+	curl_easy_setopt(cu, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t) globals.media_max_bytes);
+	curl_easy_setopt(cu, CURLOPT_FAILONERROR, 1L);
+	curl_easy_setopt(cu, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(cu, CURLOPT_PROTOCOLS, (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
+	curl_easy_setopt(cu, CURLOPT_WRITEFUNCTION, media_write);
+	curl_easy_setopt(cu, CURLOPT_WRITEDATA, &sink);
+	rc = curl_easy_perform(cu);
+	curl_easy_getinfo(cu, CURLINFO_RESPONSE_CODE, &code);
+	curl_easy_cleanup(cu);
+	if (fclose(sink.fp) != 0 && rc == CURLE_OK) rc = CURLE_WRITE_ERROR;
+	if (rc != CURLE_OK) {
+		unlink(tmp);
+		if (sink.too_large || rc == CURLE_FILESIZE_EXCEEDED) switch_snprintf(err, errlen, "fetch: too large");
+		else if (rc == CURLE_OPERATION_TIMEDOUT) switch_snprintf(err, errlen, "fetch: timeout");
+		else if (rc == CURLE_HTTP_RETURNED_ERROR) switch_snprintf(err, errlen, "fetch: http %ld", code);
+		else switch_snprintf(err, errlen, "fetch: %s", curl_easy_strerror(rc));
+		return SWITCH_FALSE;
+	}
+	if (rename(tmp, out) != 0) { /* two calls fetching the same url: the last rename wins, harmlessly */
+		unlink(tmp);
+		switch_snprintf(err, errlen, "fetch: cache dir");
+		return SWITCH_FALSE;
+	}
+	switch_mutex_lock(globals.state_mutex);
+	globals.media_fetches++;
+	switch_mutex_unlock(globals.state_mutex);
+	media_evict(globals.media_cache_dir);
+	return SWITCH_TRUE;
+}
+
 static switch_bool_t inline_collect(switch_core_session_t *session, const gb_command_t *c, outcome_t *oc, char *err, size_t errlen)
 {
 	switch_channel_t *channel = switch_core_session_get_channel(session);
 	switch_status_t st;
-	if (!sg_safe_prompt(c->file, globals.record_dir, channel_tenant(channel)) || !sg_safe_terminators(c->terminators) || !sg_collect_ok(c->min_digits, c->max_digits, c->timeout_ms)) {
+	char media[1024];
+	const char *prompt = c->file;
+	if (!zstr(c->url)) {
+		if (!zstr(c->file)) {
+			switch_snprintf(err, errlen, "collect: url and file");
+			return SWITCH_FALSE;
+		}
+		if (!sg_safe_terminators(c->terminators) || !sg_collect_ok(c->min_digits, c->max_digits, c->timeout_ms)) {
+			switch_snprintf(err, errlen, "collect: bad arguments");
+			return SWITCH_FALSE;
+		}
+		if (!media_local(c->url, media, sizeof(media), err, errlen)) return SWITCH_FALSE;
+		prompt = media;
+	} else if (!sg_safe_prompt(c->file, globals.record_dir, channel_tenant(channel)) || !sg_safe_terminators(c->terminators) || !sg_collect_ok(c->min_digits, c->max_digits, c->timeout_ms)) {
 		switch_snprintf(err, errlen, "collect: bad arguments");
 		return SWITCH_FALSE;
 	}
 	switch_channel_set_variable(channel, SWITCH_READ_TERMINATOR_USED_VARIABLE, NULL); /* switch_ivr_read only sets it, never clears it */
-	st = switch_ivr_read(session, c->min_digits, c->max_digits, zstr(c->file) ? NULL : c->file, NULL, oc->digits, sizeof(oc->digits),
+	st = switch_ivr_read(session, c->min_digits, c->max_digits, zstr(prompt) ? NULL : prompt, NULL, oc->digits, sizeof(oc->digits),
 						 c->timeout_ms, zstr(c->terminators) ? NULL : c->terminators, 0);
 	/* with min_digits >= 1, switch_ivr_read turns a timeout into TOO_SMALL; TOO_SMALL without a terminator is a timeout too */
 	oc->timed_out = (st == SWITCH_STATUS_TIMEOUT ||
@@ -1652,14 +1790,28 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 	case GB_CMD_PARK:
 		switch_core_session_execute_application(session, "park", "");
 		break;
-	case GB_CMD_PLAYBACK:
-		if (!sg_safe_prompt(c->file, globals.record_dir, channel_tenant(channel))) {
+	case GB_CMD_PLAYBACK: {
+		char media[1024];
+		const char *play = c->file;
+		if (!zstr(c->url)) {
+			if (!zstr(c->file)) {
+				switch_snprintf(err, sizeof(err), "playback: url and file");
+				ok = SWITCH_FALSE;
+				break;
+			}
+			if (!media_local(c->url, media, sizeof(media), err, sizeof(err))) {
+				ok = SWITCH_FALSE;
+				break;
+			}
+			play = media;
+		} else if (!sg_safe_prompt(c->file, globals.record_dir, channel_tenant(channel))) {
 			switch_snprintf(err, sizeof(err), "playback: bad file");
 			ok = SWITCH_FALSE;
 			break;
 		}
-		switch_core_session_execute_application(session, "playback", c->file);
+		switch_core_session_execute_application(session, "playback", play);
 		break;
+	}
 	case GB_CMD_HANGUP: {
 		switch_call_cause_t cause = switch_channel_str2cause(c->cause && *c->cause ? c->cause : "NORMAL_CLEARING");
 		switch_channel_hangup(channel, cause ? cause : SWITCH_CAUSE_NORMAL_CLEARING);
@@ -2178,7 +2330,7 @@ SWITCH_STANDARD_API(grpc_api)
 	if (!strcasecmp(argv[0], "status")) {
 		gb_cache_stats_t st;
 		char reason[256];
-		unsigned untrusted, dops, derrs;
+		unsigned untrusted, dops, derrs, mfetch, mhit;
 		char feat[128] = "";
 		char regs[160] = ""; /* the reg counters are engine-mode only; mode, tenancy and untrusted_tenant_headers print in every mode */
 		gb_cache_stats(globals.bridge, &st);
@@ -2186,6 +2338,8 @@ SWITCH_STANDARD_API(grpc_api)
 		untrusted = globals.untrusted_headers;
 		dops = globals.data_ops;
 		derrs = globals.data_errors;
+		mfetch = globals.media_fetches;
+		mhit = globals.media_cache_hits;
 		gb_features(globals.bridge, feat, sizeof feat);
 		switch_snprintf(reason, sizeof(reason), "%s", globals.last_reason);
 		if (globals.reg_mode == TN_MODE_ENGINE) {
@@ -2195,12 +2349,12 @@ SWITCH_STANDARD_API(grpc_api)
 							gb_reg_streams(globals.bridge), globals.reg_events_sent, globals.reg_events_dropped, last);
 		}
 		switch_mutex_unlock(globals.state_mutex);
-		stream->write_function(stream, "node=%s endpoints=%s connected=%s draining=%s cache_entries=%u hits=%u stale_served=%u invalidated=%u survival=%s last=\"%s\" mode=%s tenancy=%s untrusted_tenant_headers=%u features=%s data_ops=%u data_errors=%u%s\n",
+		stream->write_function(stream, "node=%s endpoints=%s connected=%s draining=%s cache_entries=%u hits=%u stale_served=%u invalidated=%u survival=%s last=\"%s\" mode=%s tenancy=%s untrusted_tenant_headers=%u features=%s data_ops=%u data_errors=%u media_fetches=%u media_cache_hits=%u%s\n",
 							   globals.node_id, globals.endpoints, gb_connected(globals.bridge) ? "yes" : "no",
 							   globals.draining ? "yes" : "no", (unsigned) st.entries, (unsigned) st.hits,
 							   (unsigned) st.stale_served, (unsigned) st.invalidated, globals.survival ? "on" : "off", reason,
 							   globals.reg_mode == TN_MODE_LOCAL ? "local" : globals.reg_mode == TN_MODE_ENGINE ? "engine" : "edge",
-							   globals.tenancy_single ? "single" : "multi", untrusted, feat, dops, derrs, regs);
+							   globals.tenancy_single ? "single" : "multi", untrusted, feat, dops, derrs, mfetch, mhit, regs);
 	} else if (!strcasecmp(argv[0], "undrain") && argc == 1) {
 		undrain();
 		stream->write_function(stream, "+OK\n");
@@ -2711,6 +2865,9 @@ static switch_status_t load_impl(switch_loadable_module_interface_t **module_int
 
 	memset(&globals, 0, sizeof(globals));
 	globals.data_timeout_ms = 1500;
+	globals.media_cache_max = 1073741824;
+	globals.media_max_bytes = 20971520;
+	globals.media_fetch_timeout_s = 10;
 	curl_global_init(CURL_GLOBAL_DEFAULT); /* reference counted; other modules may have called it */
 	memset(&c, 0, sizeof(c));
 	memset(&cb, 0, sizeof(cb));
@@ -2768,6 +2925,19 @@ static switch_status_t load_impl(switch_loadable_module_interface_t **module_int
 				int t = atoi(val);
 				if (t <= 0) switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "data-timeout %s invalid, using 1500\n", val);
 				else globals.data_timeout_ms = t;
+			}
+			else if (!strcasecmp(var, "media-hosts")) globals.media_hosts = switch_core_strdup(pool, val);
+			else if (!strcasecmp(var, "media-cache-dir")) globals.media_cache_dir = switch_core_strdup(pool, val);
+			else if (!strcasecmp(var, "media-cache-max") || !strcasecmp(var, "media-max-bytes")) {
+				long long n = atoll(val);
+				if (n <= 0) switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "%s %s invalid, using the default\n", var, val);
+				else if (!strcasecmp(var, "media-cache-max")) globals.media_cache_max = n;
+				else globals.media_max_bytes = n;
+			}
+			else if (!strcasecmp(var, "media-fetch-timeout")) {
+				int t = atoi(val);
+				if (t <= 0) switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "media-fetch-timeout %s invalid, using 10\n", val);
+				else globals.media_fetch_timeout_s = t;
 			}
 			else if (!strcasecmp(var, "registration-mode")) {
 				if (!tn_parse_mode(val, &globals.reg_mode)) { mode_ok = 0; bad_val = switch_core_strdup(pool, val); }
@@ -2844,6 +3014,7 @@ static switch_status_t load_impl(switch_loadable_module_interface_t **module_int
 	if (!zstr(globals.tenant_header_acl) && !switch_check_network_list_ip("127.0.0.1", globals.tenant_header_acl))
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "mod_grpc: tenant-header-acl %s denies 127.0.0.1 or does not exist; if it does not exist no tenant header is trusted in local/engine mode\n", globals.tenant_header_acl);
 	if (zstr(globals.peer_profile)) globals.peer_profile = "internal";
+	if (zstr(globals.media_cache_dir)) globals.media_cache_dir = switch_core_sprintf(pool, "%s/grpc-media", SWITCH_GLOBAL_dirs.storage_dir);
 	globals.directory_auth = dir_auth_set >= 0 ? dir_auth_set : (globals.reg_mode != TN_MODE_EDGE);
 	if (globals.reg_mode != TN_MODE_EDGE && !globals.directory_auth)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "mod_grpc: registration-mode=%s with directory-auth=false: sofia has no credentials to challenge with\n",

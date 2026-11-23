@@ -332,6 +332,7 @@ message Park {
 message Playback {
   string uuid = 1;
   string file = 2;
+  string url = 3; // presigned http(s) GET of a .wav/.mp3/.ogg on a media-hosts host; replaces file; inline path only
 }
 
 message Hangup {
@@ -353,6 +354,7 @@ message Collect {
   int32 max_digits = 4;
   int32 timeout_ms = 5;
   string terminators = 6;
+  string prompt_url = 7; // as Playback.url; replaces prompt
 }
 
 // Records the caller to <record-dir>/<tenant>/<name>.wav. name is one path
