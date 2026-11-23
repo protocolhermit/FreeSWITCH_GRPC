@@ -23,6 +23,7 @@
 #include "step_guard.h"
 #include "conference_recording.h"
 #include "api_guard.h"
+#include "data_api.h"
 #include "xml_fetch.h"
 #include "tenant.h"
 #include "directory_xml.h"
@@ -80,6 +81,8 @@ static struct {
 	switch_thread_t *reg_thread;
 	int reg_resync_pending;       /* the stream (re)connected: replay every live registration */
 	unsigned reg_events_sent;
+	int data_timeout_ms;          /* data-timeout, default 1500 */
+	unsigned data_ops, data_errors; /* grpc data calls that reached the engine, and replies that were not +OK (state_mutex) */
 	unsigned reg_events_dropped;  /* live RegEvents lost on a full send queue (state_mutex) */
 	time_t reg_drop_warned;
 	time_t reg_resync_last;       /* 0 = never */
@@ -2119,7 +2122,7 @@ static void undrain(void)
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "drain lifted: new inbound calls accepted\n");
 }
 
-#define GRPC_SYNTAX "status | undrain | lookup <tenant> <directory|dialplan|config> <key> | survival <tenant> | tenant <domain> | cache flush | xml"
+#define GRPC_SYNTAX "status | undrain | lookup <tenant> <directory|dialplan|config> <key> | survival <tenant> | tenant <domain> | cache flush | xml | data <get|set|del|incr|cas> <tenant> <key> ..."
 
 SWITCH_STANDARD_API(grpc_api)
 {
@@ -2127,6 +2130,38 @@ SWITCH_STANDARD_API(grpc_api)
 	int argc;
 
 	if (zstr(cmd)) goto usage;
+	if (!strncmp(cmd, "data ", 5)) { /* the value keeps its spaces, so this is not split with the others */
+		char line[DA_MAX_VALUE + 512], reply[DA_MAX_VALUE + 128];
+		da_cmd_t c;
+		gb_data_req_t rq;
+		gb_data_res_t rs;
+		int rc;
+		if (strlen(cmd) - 5 >= sizeof line) { stream->write_function(stream, "-ERR too_large\n"); return SWITCH_STATUS_SUCCESS; }
+		strcpy(line, cmd + 5);
+		if (!da_parse(line, &c) || (globals.tenancy_single && (zstr(globals.default_tenant) || strcmp(c.tenant, globals.default_tenant))) ||
+			!da_key_ok(c.key) || (c.value && !da_value_ok(c.value))) {
+			stream->write_function(stream, "-ERR bad_args\n");
+			return SWITCH_STATUS_SUCCESS;
+		}
+		if (c.value && strlen(c.value) > DA_MAX_VALUE) { stream->write_function(stream, "-ERR too_large\n"); return SWITCH_STATUS_SUCCESS; }
+		if (!gb_has_feature(globals.bridge, "data")) {
+			stream->write_function(stream, gb_connected(globals.bridge) ? "-ERR unsupported\n" : "-ERR disconnected\n");
+			return SWITCH_STATUS_SUCCESS;
+		}
+		memset(&rq, 0, sizeof rq);
+		rq.tenant_id = c.tenant; rq.key = c.key; rq.value = c.value; rq.op = c.op; rq.ttl_s = c.ttl_s;
+		rq.delta = c.delta; rq.expect_version = c.version;
+		memset(&rs, 0, sizeof rs);
+		rc = gb_data(globals.bridge, &rq, globals.data_timeout_ms, &rs);
+		da_reply(c.op, rc, rs.value, rs.version, rs.error, reply, sizeof reply);
+		gb_data_res_free(&rs);
+		switch_mutex_lock(globals.state_mutex);
+		globals.data_ops++;
+		if (strncmp(reply, "+OK", 3)) globals.data_errors++;
+		switch_mutex_unlock(globals.state_mutex);
+		stream->write_function(stream, "%s\n", reply);
+		return SWITCH_STATUS_SUCCESS;
+	}
 	mycmd = strdup(cmd);
 	argc = switch_separate_string(mycmd, ' ', argv, 5);
 	if (argc < 1) goto usage;
@@ -2134,11 +2169,15 @@ SWITCH_STANDARD_API(grpc_api)
 	if (!strcasecmp(argv[0], "status")) {
 		gb_cache_stats_t st;
 		char reason[256];
-		unsigned untrusted;
+		unsigned untrusted, dops, derrs;
+		char feat[128] = "";
 		char regs[160] = ""; /* the reg counters are engine-mode only; mode, tenancy and untrusted_tenant_headers print in every mode */
 		gb_cache_stats(globals.bridge, &st);
 		switch_mutex_lock(globals.state_mutex);
 		untrusted = globals.untrusted_headers;
+		dops = globals.data_ops;
+		derrs = globals.data_errors;
+		gb_features(globals.bridge, feat, sizeof feat);
 		switch_snprintf(reason, sizeof(reason), "%s", globals.last_reason);
 		if (globals.reg_mode == TN_MODE_ENGINE) {
 			char last[32] = "never";
@@ -2147,12 +2186,12 @@ SWITCH_STANDARD_API(grpc_api)
 							gb_reg_streams(globals.bridge), globals.reg_events_sent, globals.reg_events_dropped, last);
 		}
 		switch_mutex_unlock(globals.state_mutex);
-		stream->write_function(stream, "node=%s endpoints=%s connected=%s draining=%s cache_entries=%u hits=%u stale_served=%u invalidated=%u survival=%s last=\"%s\" mode=%s tenancy=%s untrusted_tenant_headers=%u%s\n",
+		stream->write_function(stream, "node=%s endpoints=%s connected=%s draining=%s cache_entries=%u hits=%u stale_served=%u invalidated=%u survival=%s last=\"%s\" mode=%s tenancy=%s untrusted_tenant_headers=%u features=%s data_ops=%u data_errors=%u%s\n",
 							   globals.node_id, globals.endpoints, gb_connected(globals.bridge) ? "yes" : "no",
 							   globals.draining ? "yes" : "no", (unsigned) st.entries, (unsigned) st.hits,
 							   (unsigned) st.stale_served, (unsigned) st.invalidated, globals.survival ? "on" : "off", reason,
 							   globals.reg_mode == TN_MODE_LOCAL ? "local" : globals.reg_mode == TN_MODE_ENGINE ? "engine" : "edge",
-							   globals.tenancy_single ? "single" : "multi", untrusted, regs);
+							   globals.tenancy_single ? "single" : "multi", untrusted, feat, dops, derrs, regs);
 	} else if (!strcasecmp(argv[0], "undrain") && argc == 1) {
 		undrain();
 		stream->write_function(stream, "+OK\n");
@@ -2662,6 +2701,7 @@ static switch_status_t load_impl(switch_loadable_module_interface_t **module_int
 	const char *bad_val = "";
 
 	memset(&globals, 0, sizeof(globals));
+	globals.data_timeout_ms = 1500;
 	curl_global_init(CURL_GLOBAL_DEFAULT); /* reference counted; other modules may have called it */
 	memset(&c, 0, sizeof(c));
 	memset(&cb, 0, sizeof(cb));
@@ -2714,6 +2754,11 @@ static switch_status_t load_impl(switch_loadable_module_interface_t **module_int
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "registration-streams %s out of range 1-%d, using 1\n", val, GB_MAX_REG_STREAMS);
 					c.registration_streams = 1;
 				}
+			}
+			else if (!strcasecmp(var, "data-timeout")) {
+				int t = atoi(val);
+				if (t <= 0) switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "data-timeout %s invalid, using 1500\n", val);
+				else globals.data_timeout_ms = t;
 			}
 			else if (!strcasecmp(var, "registration-mode")) {
 				if (!tn_parse_mode(val, &globals.reg_mode)) { mode_ok = 0; bad_val = switch_core_strdup(pool, val); }

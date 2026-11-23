@@ -12,7 +12,7 @@
 #define AG_MAX_FWD_HEADERS 16
 
 static const char *const ag_deny_api[] = {"system", "bg_system", "fsctl", "load", "unload", "reload", "reloadxml", "eval", "lua", "luarun",
-										  "perl", "python", "jsrun", "shutdown", "bgapi", "expand", "uuid_setvar_multi", "sched_api", "sched_transfer", "sched_broadcast", "sched_hangup", "sched_del", NULL};
+										  "perl", "python", "jsrun", "shutdown", "bgapi", "expand", "uuid_setvar_multi", "sched_api", "sched_transfer", "sched_broadcast", "sched_hangup", "sched_del", "grpc", NULL};
 static const char *const ag_deny_app[] = {"system", "bgsystem", "lua", "luarun", "perl", "python", "javascript", "eval", "socket",
 										  "execute_extension", "set_global", "set_profile_var", "multiset", "limit_execute", "bind_meta_app", "bind_digit_action",
 										  "sched_broadcast", "sched_transfer", "sched_hangup", NULL};
