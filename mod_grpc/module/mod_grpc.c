@@ -393,7 +393,7 @@ static switch_bool_t exec_message_waiting(const cmd_item_t *c, char *err, size_t
 	char tenant[64], voice[64], acct[256];
 	switch_event_t *ev = NULL;
 
-	if (zstr(c->user) || zstr(c->domain) || !sg_safe_name(c->user) || !sg_safe_name(c->domain)) {
+	if (zstr(c->user) || zstr(c->domain) || !sg_mwi_user(c->user) || !sg_safe_name(c->domain)) {
 		switch_snprintf(err, errlen, "mwi: bad user or domain");
 		return SWITCH_FALSE;
 	}
@@ -424,7 +424,7 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 	char pdial[PEER_DIAL_MAX];
 	int ctl = 1;
 
-	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_MESSAGE_WAITING) { /* AMD (inline only) falls to the default case */
+	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_ANSWER) { /* AMD (inline only) falls to the default case */
 		switch_snprintf(err, errlen, "unknown command type %d", c->type);
 		return SWITCH_FALSE;
 	}
@@ -489,6 +489,8 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 		return run_api("uuid_broadcast", args, err, errlen);
 	case GB_CMD_PARK:
 		return run_api("uuid_park", c->uuid, err, errlen);
+	case GB_CMD_ANSWER:
+		return run_api("uuid_answer", c->uuid, err, errlen);
 	case GB_CMD_PLAYBACK:
 		if (!zstr(c->url)) {
 			switch_snprintf(err, errlen, "playback: url is inline only");
@@ -1802,7 +1804,7 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 	const char *dial = c->dial_string;
 	switch_bool_t ok = SWITCH_TRUE;
 
-	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_MESSAGE_WAITING) { /* the bridge maps an unknown action to type 0 */
+	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_ANSWER) { /* the bridge maps an unknown action to type 0 */
 		switch_snprintf(err, sizeof(err), "unknown command type %d", c->type);
 		ok = SWITCH_FALSE;
 	} else if (c->type == GB_CMD_CONFERENCE_CONTROL) { /* no channel to check the tenant against: stream commands only */
@@ -1856,6 +1858,12 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 	}
 	case GB_CMD_PARK:
 		switch_core_session_execute_application(session, "park", "");
+		break;
+	case GB_CMD_ANSWER: /* already answered: SUCCESS, a no-op */
+		if (switch_channel_answer(channel) != SWITCH_STATUS_SUCCESS) {
+			switch_snprintf(err, sizeof(err), "answer: failed");
+			ok = SWITCH_FALSE;
+		}
 		break;
 	case GB_CMD_PLAYBACK: {
 		char media[1024];

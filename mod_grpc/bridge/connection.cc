@@ -225,6 +225,7 @@ bool gb_bridge::run_stream(const std::string& target, const std::string& host) {
   h->set_boot_id(boot_id);
   h->set_sip_address(sip_address);
   h->set_registration_mode(registration_mode);
+  h->add_features("answer");
   for (auto& t : split(tags, ',')) h->add_tags(t);
 
   // The watchdog cancels the stream when no HelloAck arrives in time.

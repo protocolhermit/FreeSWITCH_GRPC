@@ -59,6 +59,8 @@ message Hello {
   string boot_id = 6;
   string sip_address = 7;       // host:port the node's SIP profile listens on; empty when unset
   string registration_mode = 8; // "engine" or "local"; empty when unset
+  // Optional capabilities this node serves, e.g. "answer" (it runs Command.answer). Absent = none.
+  repeated string features = 9;
 }
 
 message HelloAck {
@@ -272,6 +274,7 @@ message Command {
     ConferenceControl conference_control = 19;
     Amd amd = 20;
     MessageWaiting message_waiting = 21;
+    Answer answer = 22;
   }
   // Set only on the last command of a batch, and only when the node must
   // report how it ended (a StepResult echoing this id). Empty: no report.
@@ -426,6 +429,11 @@ message Sleep {
 // Inline only. The node runs the mod_amd application on this session and
 // reports amd_result / amd_cause. The stream path refuses it.
 message Amd {
+  string uuid = 1;
+}
+
+// Answers the call (200 OK). Playback, Collect and Record only pre-answer (early media).
+message Answer {
   string uuid = 1;
 }
 

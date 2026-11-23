@@ -152,6 +152,10 @@ bool fill(const cp::Command& c, gb_command_t* o, const char* (*str)(const std::s
       o->new_urgent = c.message_waiting().new_urgent();
       o->saved_urgent = c.message_waiting().saved_urgent();
       return true;
+    case cp::Command::kAnswer:
+      o->type = GB_CMD_ANSWER;
+      o->uuid = str(c.answer().uuid());
+      return true;
     default:
       return false;
   }

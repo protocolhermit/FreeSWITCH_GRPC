@@ -56,6 +56,7 @@ extern "C" {
 #define GB_CMD_CONFERENCE_CONTROL 16
 #define GB_CMD_AMD 17
 #define GB_CMD_MESSAGE_WAITING 18
+#define GB_CMD_ANSWER 19
 
 #define GB_LOG_ERR 0
 #define GB_LOG_WARN 1

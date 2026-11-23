@@ -21,6 +21,12 @@ static inline int sg_safe_name(const char *v)
 	return 1;
 }
 
+/* An MWI user: a safe name, or one leading '+' (E.164) and then a safe name. */
+static inline int sg_mwi_user(const char *v)
+{
+	return v && (*v == '+' ? v[1] != '+' && sg_safe_name(v + 1) : sg_safe_name(v));
+}
+
 /* Empty is fine (no terminator); otherwise up to 4 of "0123456789#*". */
 static inline int sg_safe_terminators(const char *v)
 {
