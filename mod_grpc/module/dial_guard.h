@@ -81,13 +81,15 @@ static inline int dg_dialer_var_ok(const char *key, const char *value)
 }
 
 /* A variable an Originate command may put in the leg's {k=v} block: a plain name (1-64 of [A-Za-z0-9_-], so no ',',
- * '=' or "nolocal:" prefix) that is not one FreeSWITCH runs as an API or application, or transfers the call to, later.
- * Channel variable names are case-insensitive, so the prefixes are too. */
+ * '=' or "nolocal:" prefix) that is not one FreeSWITCH runs as an API or application, or transfers the call to, later,
+ * nor one it plays as media (ringback, hold music): those take any path or stream (shell_stream://, another tenant's
+ * recording), which sg_safe_prompt refuses everywhere else. Channel variable names are case-insensitive, so the prefixes are too. */
 static inline int dg_originate_var_ok(const char *key)
 {
 	static const char *const deny[] = {"api_", "execute_", "exec_", "bridge_pre_execute", "session_in_hangup_hook",
 									   "record_post_process_exec", "transfer_after_", "park_after_", "transfer_on_fail",
-									   "force_transfer_", "group_confirm_", NULL};
+									   "force_transfer_", "group_confirm_", "ringback", "transfer_ringback", "hold_music",
+									   "temp_hold_music", NULL};
 	const char *const *d;
 	if (!key || !dg_safe_ident(key, strlen(key))) return 0;
 	for (d = deny; *d; d++) {
