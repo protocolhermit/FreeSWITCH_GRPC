@@ -271,6 +271,7 @@ message Command {
     BridgeLegs bridge_legs = 18;
     ConferenceControl conference_control = 19;
     Amd amd = 20;
+    MessageWaiting message_waiting = 21;
   }
   // Set only on the last command of a batch, and only when the node must
   // report how it ended (a StepResult echoing this id). Empty: no report.
@@ -426,6 +427,17 @@ message Sleep {
 // reports amd_result / amd_cause. The stream path refuses it.
 message Amd {
   string uuid = 1;
+}
+
+// Stream only: the node fires a message-waiting event for user@domain, which
+// sofia turns into a NOTIFY to that user's devices registered on this node.
+message MessageWaiting {
+  string user = 1;
+  string domain = 2;
+  int32 new_msgs = 3;
+  int32 saved_msgs = 4;
+  int32 new_urgent = 5;
+  int32 saved_urgent = 6;
 }
 
 // result is HUMAN, MACHINE, or NOTSURE. cause is the module's reason

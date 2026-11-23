@@ -124,7 +124,8 @@ static struct {
 
 typedef struct {
 	char *command_id, *tenant_id, *uuid, *dial_string, *file, *cause, *peer_tenant_id, *peer_caller_id;
-	char *target_uuid, *token, *room, *rec_id, *upload_url, *url;
+	char *target_uuid, *token, *room, *rec_id, *upload_url, *url, *user, *domain;
+	int new_msgs, saved_msgs, new_urgent, saved_urgent;
 	int type, conf_action, timeout_s, deadline_s, mode, leg_only, route_on_answer, max_len_s;
 	char **keys, **values;
 	size_t nvars;
@@ -153,6 +154,12 @@ static cmd_item_t *cmd_dup(const gb_command_t *c)
 	o->rec_id = dupz(c->rec_id);
 	o->upload_url = dupz(c->upload_url);
 	o->url = dupz(c->url);
+	o->user = dupz(c->user);
+	o->domain = dupz(c->domain);
+	o->new_msgs = c->new_msgs;
+	o->saved_msgs = c->saved_msgs;
+	o->new_urgent = c->new_urgent;
+	o->saved_urgent = c->saved_urgent;
 	o->conf_action = c->conf_action;
 	o->max_len_s = c->max_len_s;
 	o->file = dupz(c->file);
@@ -181,7 +188,7 @@ static cmd_item_t *cmd_dup(const gb_command_t *c)
 	}
 	{ /* out of memory anywhere above: refuse the whole command rather than run one with a missing field */
 		int bad = !o->command_id || !o->tenant_id || !o->uuid || !o->dial_string || !o->peer_tenant_id || !o->peer_caller_id ||
-				  !o->target_uuid || !o->token || !o->room || !o->rec_id || !o->upload_url || !o->url || !o->file || !o->cause ||
+				  !o->target_uuid || !o->token || !o->room || !o->rec_id || !o->upload_url || !o->url || !o->user || !o->domain || !o->file || !o->cause ||
 				  !o->peer_target || (o->npeers && !o->peers) || o->nvars != c->nvars;
 		for (i = 0; !bad && i < o->npeers; i++) bad = !o->peers[i];
 		for (i = 0; !bad && i < o->nvars; i++) bad = !o->keys[i] || !o->values[i];
@@ -200,7 +207,7 @@ static void cmd_free(cmd_item_t *o)
 	free(o->command_id); free(o->tenant_id); free(o->uuid);
 	free(o->dial_string); free(o->file); free(o->cause);
 	free(o->peer_tenant_id); free(o->peer_caller_id);
-	free(o->target_uuid); free(o->token); free(o->room); free(o->rec_id); free(o->upload_url); free(o->url);
+	free(o->target_uuid); free(o->token); free(o->room); free(o->rec_id); free(o->upload_url); free(o->url); free(o->user); free(o->domain);
 	for (i = 0; i < o->nvars; i++) { free(o->keys[i]); free(o->values[i]); }
 	free(o->keys); free(o->values);
 	for (i = 0; i < o->npeers && o->peers; i++) free(o->peers[i]);
@@ -378,6 +385,38 @@ static switch_bool_t exec_conference_control(const cmd_item_t *c, char *err, siz
 	return run_conference_api(args, err, errlen);
 }
 
+static int tenant_for(switch_channel_t *channel, const char *domain, char *out, size_t outlen);
+
+/* Fire the message-waiting event for one user of the command's tenant; sofia sends the NOTIFY. */
+static switch_bool_t exec_message_waiting(const cmd_item_t *c, char *err, size_t errlen)
+{
+	char tenant[64], voice[64], acct[256];
+	switch_event_t *ev = NULL;
+
+	if (zstr(c->user) || zstr(c->domain) || !sg_safe_name(c->user) || !sg_safe_name(c->domain)) {
+		switch_snprintf(err, errlen, "mwi: bad user or domain");
+		return SWITCH_FALSE;
+	}
+	if (tenant_for(NULL, c->domain, tenant, sizeof(tenant)) == TN_SRC_NONE || strcmp(tenant, c->tenant_id)) {
+		switch_snprintf(err, errlen, "mwi: domain not in tenant");
+		return SWITCH_FALSE;
+	}
+	if (!sg_mwi_voice(c->new_msgs, c->saved_msgs, c->new_urgent, c->saved_urgent, voice, sizeof(voice))) {
+		switch_snprintf(err, errlen, "mwi: bad counts");
+		return SWITCH_FALSE;
+	}
+	switch_snprintf(acct, sizeof(acct), "sip:%s@%s", c->user, c->domain);
+	if (switch_event_create(&ev, SWITCH_EVENT_MESSAGE_WAITING) != SWITCH_STATUS_SUCCESS) {
+		switch_snprintf(err, errlen, "mwi: event");
+		return SWITCH_FALSE;
+	}
+	switch_event_add_header_string(ev, SWITCH_STACK_BOTTOM, "MWI-Messages-Waiting", c->new_msgs + c->new_urgent > 0 ? "yes" : "no");
+	switch_event_add_header_string(ev, SWITCH_STACK_BOTTOM, "MWI-Message-Account", acct);
+	switch_event_add_header_string(ev, SWITCH_STACK_BOTTOM, "MWI-Voice-Message", voice);
+	switch_event_fire(&ev);
+	return SWITCH_TRUE;
+}
+
 /* Commands that arrive on the stream (or name another call): by uuid, via the API layer. */
 static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 {
@@ -385,7 +424,7 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 	char pdial[PEER_DIAL_MAX];
 	int ctl = 1;
 
-	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_CONFERENCE_CONTROL) {
+	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_MESSAGE_WAITING) { /* AMD (inline only) falls to the default case */
 		switch_snprintf(err, errlen, "unknown command type %d", c->type);
 		return SWITCH_FALSE;
 	}
@@ -395,6 +434,8 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 		return exec_originate(c, err, errlen);
 	case GB_CMD_CONFERENCE_CONTROL:
 		return exec_conference_control(c, err, errlen);
+	case GB_CMD_MESSAGE_WAITING:
+		return exec_message_waiting(c, err, errlen);
 	case GB_CMD_DRAIN:
 		globals.draining = SWITCH_TRUE;
 		switch_core_session_ctl(SCSC_PAUSE_INBOUND, &ctl); /* non-zero sets SCF_NO_NEW_INBOUND_SESSIONS */
@@ -1744,11 +1785,14 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 	const char *dial = c->dial_string;
 	switch_bool_t ok = SWITCH_TRUE;
 
-	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_AMD) { /* the bridge maps an unknown action to type 0 */
+	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_MESSAGE_WAITING) { /* the bridge maps an unknown action to type 0 */
 		switch_snprintf(err, sizeof(err), "unknown command type %d", c->type);
 		ok = SWITCH_FALSE;
 	} else if (c->type == GB_CMD_CONFERENCE_CONTROL) { /* no channel to check the tenant against: stream commands only */
 		switch_snprintf(err, sizeof(err), "conference_control: stream only");
+		ok = SWITCH_FALSE;
+	} else if (c->type == GB_CMD_MESSAGE_WAITING) { /* names a user, not a call: stream commands only */
+		switch_snprintf(err, sizeof(err), "message_waiting: stream only");
 		ok = SWITCH_FALSE;
 	} else if (c->uuid && *c->uuid && strcmp(c->uuid, mine)) { /* names another call: same path as stream commands */
 		cmd_item_t *item = cmd_dup(c);

@@ -55,6 +55,7 @@ extern "C" {
 #define GB_CMD_BRIDGE_LEGS 15
 #define GB_CMD_CONFERENCE_CONTROL 16
 #define GB_CMD_AMD 17
+#define GB_CMD_MESSAGE_WAITING 18
 
 #define GB_LOG_ERR 0
 #define GB_LOG_WARN 1
@@ -156,6 +157,8 @@ typedef struct {
 	const char *const *peer_addresses; /* Bridge: hop addresses, npeer_addresses entries */
 	size_t npeer_addresses;
 	const char *peer_target;           /* Bridge: user@domain for the hop legs */
+	const char *user, *domain;                  /* MessageWaiting */
+	int32_t new_msgs, saved_msgs, new_urgent, saved_urgent;
 } gb_command_t;
 
 typedef struct {

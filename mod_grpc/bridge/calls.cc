@@ -143,6 +143,15 @@ bool fill(const cp::Command& c, gb_command_t* o, const char* (*str)(const std::s
       o->type = GB_CMD_AMD;
       o->uuid = str(c.amd().uuid());
       return true;
+    case cp::Command::kMessageWaiting:
+      o->type = GB_CMD_MESSAGE_WAITING;
+      o->user = str(c.message_waiting().user());
+      o->domain = str(c.message_waiting().domain());
+      o->new_msgs = c.message_waiting().new_msgs();
+      o->saved_msgs = c.message_waiting().saved_msgs();
+      o->new_urgent = c.message_waiting().new_urgent();
+      o->saved_urgent = c.message_waiting().saved_urgent();
+      return true;
     default:
       return false;
   }
@@ -351,6 +360,8 @@ void gb_route_result_free(gb_route_result_t* r) {
     std::free(const_cast<char*>(c.name));
     std::free(const_cast<char*>(c.upload_url));
     std::free(const_cast<char*>(c.url));
+    std::free(const_cast<char*>(c.user));
+    std::free(const_cast<char*>(c.domain));
     std::free(const_cast<char*>(c.rec_id));
     std::free(const_cast<char*>(c.target_uuid));
     std::free(const_cast<char*>(c.token));

@@ -105,6 +105,15 @@ static inline int sg_room(char *out, size_t n, const char *tenant, const char *r
 	return w > 0 && (size_t) w < n;
 }
 
+/* The MWI-Voice-Message value "<new>/<saved> (<new_urgent>/<saved_urgent>)". 0 on a negative count or a too-small buffer. */
+static inline int sg_mwi_voice(int nw, int sv, int nu, int su, char *out, size_t n)
+{
+	int w;
+	if (nw < 0 || sv < 0 || nu < 0 || su < 0) return 0;
+	w = snprintf(out, n, "%d/%d (%d/%d)", nw, sv, nu, su);
+	return w > 0 && (size_t) w < n;
+}
+
 /* A presigned object-store URL: http(s), bounded, no whitespace, control or quoting characters. */
 static inline int sg_safe_url(const char *v)
 {
