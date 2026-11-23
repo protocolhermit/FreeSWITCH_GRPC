@@ -931,11 +931,25 @@ static void media_evict(const char *dir, const char *keep)
 	}
 }
 
-/* Fetched or cached local path for url in out; false with err set. Runs on the session thread (up to
- * media-fetch-timeout seconds of silence for the caller). */
-static switch_bool_t media_local(const char *url, char *out, size_t outlen, char *err, size_t errlen)
+/* switch_dir_make_recursive allocates from the pool it is given: a short-lived one, so a caller on a long-lived
+ * thread (the command thread, a session that plays many URLs) never grows a pool that outlives it. */
+static switch_status_t make_dir(const char *dir)
 {
-	char name[40], tmp[1100];
+	switch_memory_pool_t *mp = NULL;
+	switch_status_t st = SWITCH_STATUS_FALSE;
+	if (switch_core_new_memory_pool(&mp) == SWITCH_STATUS_SUCCESS) {
+		st = switch_dir_make_recursive(dir, SWITCH_DEFAULT_DIR_PERMS, mp);
+		switch_core_destroy_memory_pool(&mp);
+	}
+	return st;
+}
+
+/* Fetched or cached local path for url in out; false with err set. Runs on the session thread (up to
+ * media-fetch-timeout seconds of silence for the caller). tenant is the channel's own (channel_tenant): the cache is
+ * per tenant, because the presigned signature is not part of the cache key. */
+static switch_bool_t media_local(const char *tenant, const char *url, char *out, size_t outlen, char *err, size_t errlen)
+{
+	char name[64], tmp[1100]; /* name: "<uuid>-<16 hex>.<ext>", 57 bytes and the NUL */
 	struct stat st;
 	media_sink_t sink = { 0 };
 	CURL *cu;
@@ -945,8 +959,8 @@ static switch_bool_t media_local(const char *url, char *out, size_t outlen, char
 		switch_snprintf(err, errlen, "fetch: no media-hosts");
 		return SWITCH_FALSE;
 	}
-	if (!mf_url_ok(url, globals.media_hosts) || !mf_cache_name(url, name, sizeof(name))) {
-		switch_snprintf(err, errlen, "fetch: not allowed");
+	if (!mf_url_ok(url, globals.media_hosts) || !mf_cache_name(tenant, url, name, sizeof(name))) {
+		switch_snprintf(err, errlen, tenant ? "fetch: not allowed" : "fetch: no tenant");
 		return SWITCH_FALSE;
 	}
 	if (snprintf(out, outlen, "%s/%s", globals.media_cache_dir, name) >= (int) outlen || snprintf(tmp, sizeof(tmp), "%s.tmp.%lu", out, (unsigned long) pthread_self()) >= (int) sizeof(tmp)) {
@@ -960,17 +974,9 @@ static switch_bool_t media_local(const char *url, char *out, size_t outlen, char
 		switch_mutex_unlock(globals.state_mutex);
 		return SWITCH_TRUE;
 	}
-	{ /* switch_dir_make_recursive allocates from its pool: a short-lived one, never NULL */
-		switch_memory_pool_t *mp = NULL;
-		switch_status_t ds = SWITCH_STATUS_FALSE;
-		if (switch_core_new_memory_pool(&mp) == SWITCH_STATUS_SUCCESS) {
-			ds = switch_dir_make_recursive(globals.media_cache_dir, SWITCH_DEFAULT_DIR_PERMS, mp);
-			switch_core_destroy_memory_pool(&mp);
-		}
-		if (ds != SWITCH_STATUS_SUCCESS) {
-			switch_snprintf(err, errlen, "fetch: cache dir");
-			return SWITCH_FALSE;
-		}
+	if (make_dir(globals.media_cache_dir) != SWITCH_STATUS_SUCCESS) {
+		switch_snprintf(err, errlen, "fetch: cache dir");
+		return SWITCH_FALSE;
 	}
 	if (!(sink.fp = fopen(tmp, "wb"))) {
 		switch_snprintf(err, errlen, "fetch: cache dir");
@@ -1041,7 +1047,7 @@ static switch_bool_t inline_collect(switch_core_session_t *session, const gb_com
 			switch_snprintf(err, errlen, "collect: bad arguments");
 			return SWITCH_FALSE;
 		}
-		if (!media_local(c->url, media, sizeof(media), err, errlen)) return SWITCH_FALSE;
+		if (!media_local(channel_tenant(channel), c->url, media, sizeof(media), err, errlen)) return SWITCH_FALSE;
 		prompt = media;
 	} else if (!sg_safe_prompt(c->file, globals.record_dir, channel_tenant(channel)) || !sg_safe_terminators(c->terminators) || !sg_collect_ok(c->min_digits, c->max_digits, c->timeout_ms)) {
 		switch_snprintf(err, errlen, "collect: bad arguments");
@@ -1410,7 +1416,7 @@ static switch_bool_t exec_conf_record_start(const cmd_item_t *c, const char *con
 	}
 	j->deadline_ms = cr_now_ms() + (int64_t) c->max_len_s * 1000;
 	switch_mutex_unlock(globals.rec_mutex);
-	if (switch_dir_make_recursive(dir, SWITCH_DEFAULT_DIR_PERMS, globals.pool) != SWITCH_STATUS_SUCCESS) {
+	if (make_dir(dir) != SWITCH_STATUS_SUCCESS) { /* not globals.pool: it would grow by every recording start */
 		cr_fail_admitted(j, err, errlen, "conference record: cannot create directory");
 		return SWITCH_FALSE;
 	}
@@ -1876,7 +1882,7 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 				ok = SWITCH_FALSE;
 				break;
 			}
-			if (!media_local(c->url, media, sizeof(media), err, sizeof(err))) {
+			if (!media_local(channel_tenant(channel), c->url, media, sizeof(media), err, sizeof(err))) {
 				ok = SWITCH_FALSE;
 				break;
 			}
@@ -3263,6 +3269,10 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_grpc_shutdown)
 	undrain(); /* after the command thread: no Drain can land behind it; an unloaded module must not leave the node paused */
 	/* Deliberately leave the stopped bridge allocated and globals.bridge set (a small leak per unload): in-flight
 	 * event/route/API users are not waited for, and on a stopped bridge they just get GB_ERR_DISCONNECTED instead of
-	 * touching freed memory or NULL. */
-	return SWITCH_STATUS_SUCCESS;
+	 * touching freed memory or NULL.
+	 * NOUNLOAD keeps the module pool too, for the same users: a plain `unload` refuses while a call is in grpc_route
+	 * ("Module in use"), but `unload -f` does not, and the pool holds globals' strings and state_mutex, which such a
+	 * call keeps reading (report_step can retry for ~24 s). The code stays mapped anyway (-z nodelete).
+	 * ponytail: a `load` right after a forced unload resets globals under such a call; wait for calls to end first. */
+	return SWITCH_STATUS_NOUNLOAD;
 }

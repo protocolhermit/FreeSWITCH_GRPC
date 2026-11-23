@@ -333,8 +333,12 @@ the caller hears silence meanwhile.
 - Only `.wav`, `.mp3` and `.ogg`, from a listed host, over http or https.
   Redirects are not followed. A non-2xx answer is the error `fetch: http <code>`
   and is never cached.
-- The cache key is the host and object path. The scheme, port and query string
-  are ignored, so one object path must always hold the same content.
+- The cache key is the call's tenant, the host and the object path. The
+  scheme, port and query string are ignored, so one object path must always
+  hold the same content. Because the signature is not part of the key, each
+  tenant downloads its own copy: one tenant never plays another's cached file.
+  A call whose `tenant_id` is not UUID-shaped cannot play URLs
+  (`fetch: no tenant`).
 - URLs work only in a call's own route or step answer. On the stream path they
   are refused.
 - `local_stream://<name>` is accepted in prompts. The stream itself comes from
