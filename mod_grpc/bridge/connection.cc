@@ -256,7 +256,9 @@ bool gb_bridge::run_stream(const std::string& target, const std::string& host) {
   finish_handshake();
   if (!accepted || timed_out) {
     std::string reason = got && ack.has_hello_ack() ? ack.hello_ack().reason() : "";
-    if (accepted) reason = "no RegStreamAck in time";
+    // accepted yet timed out: the watchdog fired after the HelloAck read, during the shard opens or just before
+    // finish_handshake; with no shards it was the HelloAck that came too late
+    if (accepted) reason = reg_streams > 0 ? "no RegStreamAck in time" : "HelloAck too late";
     close_regs(s);
     s->ctx.TryCancel();
     grpc::Status st = s->stream->Finish();
@@ -503,6 +505,8 @@ gb_bridge_t* gb_create(const gb_config_t* cfg, const gb_callbacks_t* cb, void* u
   try {
     if (!cfg || !cb || !cfg->endpoints || !cfg->node_id || !cb->on_state || !cb->on_command) return nullptr;
     static std::once_flag once;
+    // ponytail: setenv races a getenv on another FreeSWITCH thread; gRPC reads this only from the environment, once,
+    // before its first channel, so it must be set here. Setting it in the service's environment is the clean upgrade.
     std::call_once(once, [] { setenv("GRPC_ENABLE_FORK_SUPPORT", "0", 1); });
     auto* b = new gb_bridge(cfg->cache_max_entries > 0 ? static_cast<size_t>(cfg->cache_max_entries) : 10000);
     b->endpoints = cfg->endpoints;

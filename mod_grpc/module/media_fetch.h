@@ -40,14 +40,14 @@ static inline const char *mf_ext(const char *path, size_t n)
 	return NULL;
 }
 
-/* 1 when url passes sg_safe_url, is http(s) with no userinfo ('@' before the path), its host (exact, case-insensitive,
- * port stripped) is in the comma-separated hosts list, and the path (before '?' or '#') ends in .wav/.mp3/.ogg. */
-static inline int mf_url_ok(const char *url, const char *hosts)
+/* 1 when url passes sg_safe_url, is http(s) with no userinfo ('@' before the path) and an object path, and its host
+ * (exact, case-insensitive, port stripped) is in the comma-separated hosts list. */
+static inline int mf_host_ok(const char *url, const char *hosts)
 {
 	char host[256];
 	const char *path, *h;
 	size_t pn, hn;
-	if (!hosts || !*hosts || !mf_split(url, host, sizeof host, &path, &pn) || !mf_ext(path, pn)) return 0;
+	if (!hosts || !*hosts || !mf_split(url, host, sizeof host, &path, &pn)) return 0;
 	hn = strlen(host);
 	for (h = hosts; *h;) {
 		const char *e = h + strcspn(h, ",");
@@ -58,6 +58,22 @@ static inline int mf_url_ok(const char *url, const char *hosts)
 		h = *e ? e + 1 : e;
 	}
 	return 0;
+}
+
+/* mf_host_ok, and the path (before '?' or '#') ends in .wav/.mp3/.ogg: a URL remote media may play. */
+static inline int mf_url_ok(const char *url, const char *hosts)
+{
+	char host[256];
+	const char *path;
+	size_t pn;
+	return mf_host_ok(url, hosts) && mf_split(url, host, sizeof host, &path, &pn) && mf_ext(path, pn);
+}
+
+/* A presigned upload target: sg_safe_url, and when hosts is set (upload-hosts) also mf_host_ok. Unset keeps any
+ * http(s) host, as before the setting existed. */
+static inline int mf_upload_ok(const char *url, const char *hosts)
+{
+	return sg_safe_url(url) && (!hosts || !*hosts || mf_host_ok(url, hosts));
 }
 
 /* 16 lowercase hex digits then .wav, .mp3 or .ogg, and nothing after */

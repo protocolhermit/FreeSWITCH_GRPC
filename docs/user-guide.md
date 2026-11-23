@@ -139,6 +139,7 @@ Add `<load module="mod_grpc"/>` to `modules.conf.xml`, or run `load mod_grpc` fr
 | `media-cache-max` | `1073741824` | Cache size cap in bytes. Over it, the oldest files go first (the file just fetched is never removed). A value below `media-max-bytes` is raised to it, with a warning. |
 | `media-max-bytes` | `20971520` | Per-file download cap. |
 | `media-fetch-timeout` | `10` | Seconds per download. |
+| `upload-hosts` | – | Comma-separated host names a recording's `upload_url` (Record, conference recording) may PUT to, matched like `media-hosts`. A URL to any other host is refused (`record: bad upload url`). Empty (the default) allows any http or https host. |
 | `<domain-tenants>` | – | A block next to `<settings>`: `<domain name="acme.example" tenant="<uuid>"/>`. Maps a domain to a tenant without asking the engine. Used in `local` mode only. |
 
 The module **refuses to load** in these cases:

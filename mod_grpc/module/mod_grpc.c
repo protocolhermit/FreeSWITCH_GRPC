@@ -85,6 +85,7 @@ static struct {
 	unsigned reg_events_sent;
 	int data_timeout_ms;          /* data-timeout, default 1500 */
 	char *media_hosts, *media_cache_dir; /* media-hosts (empty = remote media off), media-cache-dir */
+	char *upload_hosts;           /* upload-hosts: hosts a recording may be PUT to (empty = any http(s) host) */
 	int64_t media_cache_max, media_max_bytes; /* media-cache-max, media-max-bytes */
 	int media_fetch_timeout_s;    /* media-fetch-timeout */
 	unsigned media_fetches, media_cache_hits; /* downloads done, and plays served from the cache (state_mutex) */
@@ -480,8 +481,9 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 			switch_core_session_rwunlock(target);
 		}
 		if (c->timeout_s > 0) {
-			switch_snprintf(args, sizeof(args), "%s call_timeout=%d", c->uuid, c->timeout_s);
-			run_api("uuid_setvar", args, err, errlen);
+			/* "<uuid> <var> <value>": uuid_setvar splits on the first space; "call_timeout=N" set a variable of that whole name */
+			switch_snprintf(args, sizeof(args), "%s call_timeout %d", c->uuid, c->timeout_s);
+			if (!run_api("uuid_setvar", args, err, errlen)) return SWITCH_FALSE; /* the bridge would ring without its timeout */
 		}
 		/* snprintf, not switch_snprintf: its return is the needed length, so a cut-off dial string is refused, never run */
 		if (snprintf(args, sizeof(args), "%s bridge::%s aleg", c->uuid, c->npeers ? pdial : c->dial_string) >= (int) sizeof(args)) {
@@ -508,7 +510,8 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 		}
 		return run_api("uuid_broadcast", args, err, errlen);
 	case GB_CMD_HANGUP:
-		switch_snprintf(args, sizeof(args), "%s %s", c->uuid, c->cause[0] ? c->cause : "NORMAL_CLEARING");
+		/* the canonical name, never the engine's text: an unknown cause is NORMAL_CLEARING, as on the inline path */
+		switch_snprintf(args, sizeof(args), "%s %s", c->uuid, switch_channel_cause2str(switch_channel_str2cause(c->cause)));
 		return run_api("uuid_kill", args, err, errlen);
 	case GB_CMD_SUPERVISE_MODE: {
 		char digit = sg_supervise_mode_dtmf(c->mode);
@@ -995,7 +998,8 @@ static switch_bool_t media_local(const char *tenant, const char *url, char *out,
 	curl_easy_setopt(cu, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t) globals.media_max_bytes);
 	curl_easy_setopt(cu, CURLOPT_FAILONERROR, 1L);
 	curl_easy_setopt(cu, CURLOPT_NOSIGNAL, 1L);
-	curl_easy_setopt(cu, CURLOPT_PROTOCOLS, (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
+	curl_easy_setopt(cu, CURLOPT_PROTOCOLS_STR, "http,https");
+	curl_easy_setopt(cu, CURLOPT_PROXY, ""); /* ignore env proxies, as upload_file does: media-hosts names the host we reach */
 	curl_easy_setopt(cu, CURLOPT_WRITEFUNCTION, media_write);
 	curl_easy_setopt(cu, CURLOPT_WRITEDATA, &sink);
 	rc = curl_easy_perform(cu);
@@ -1381,7 +1385,7 @@ static switch_bool_t exec_conf_record_start(const cmd_item_t *c, const char *con
 		switch_snprintf(err, errlen, "conference record: bad id or duration");
 		return SWITCH_FALSE; /* malformed: command result only */
 	}
-	if (zstr(c->upload_url) || !sg_safe_url(c->upload_url)) {
+	if (zstr(c->upload_url) || !mf_upload_ok(c->upload_url, globals.upload_hosts)) {
 		switch_snprintf(err, errlen, "conference record: bad upload url");
 		return SWITCH_FALSE;
 	}
@@ -1732,7 +1736,7 @@ static switch_bool_t inline_record(switch_core_session_t *session, const gb_comm
 		oc->path[0] = 0;
 		return SWITCH_FALSE;
 	}
-	if (!zstr(c->upload_url) && !sg_safe_url(c->upload_url)) {
+	if (!zstr(c->upload_url) && !mf_upload_ok(c->upload_url, globals.upload_hosts)) {
 		switch_snprintf(err, errlen, "record: bad upload url");
 		oc->path[0] = 0;
 		return SWITCH_FALSE;
@@ -3010,6 +3014,7 @@ static switch_status_t load_impl(switch_loadable_module_interface_t **module_int
 				else globals.data_timeout_ms = t;
 			}
 			else if (!strcasecmp(var, "media-hosts")) globals.media_hosts = switch_core_strdup(pool, val);
+			else if (!strcasecmp(var, "upload-hosts")) globals.upload_hosts = switch_core_strdup(pool, val);
 			else if (!strcasecmp(var, "media-cache-dir")) globals.media_cache_dir = switch_core_strdup(pool, val);
 			else if (!strcasecmp(var, "media-cache-max") || !strcasecmp(var, "media-max-bytes")) {
 				long long n = atoll(val);
