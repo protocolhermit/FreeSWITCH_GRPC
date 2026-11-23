@@ -2,6 +2,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <cctype>
+#include <functional>
+
 #include "bridge_internal.h"
 
 namespace {
@@ -403,7 +406,14 @@ int gb_send_reg_event(gb_bridge_t* b, const gb_reg_event_t* r) {
     e->set_user_agent(gb::text(r->user_agent));
     e->set_call_id(gb::text(r->call_id));
     e->set_resync(r->resync != 0);
-    return s->send(std::move(m));
+    if (s->regs.empty()) return s->send(std::move(m), r->resync ? gb::kMaxQueue / 2 : gb::kMaxQueue);
+    // One AOR always on one shard, so its REGISTER/UNREGISTER/EXPIRE stay in order. Domains are case-insensitive.
+    std::string key = e->user() + "@" + e->domain();
+    for (size_t i = e->user().size() + 1; i < key.size(); i++) key[i] = static_cast<char>(tolower(static_cast<unsigned char>(key[i])));
+    size_t shard = std::hash<std::string>{}(key) % s->regs.size();
+    cp::RegStreamMessage rm;
+    rm.mutable_event()->Swap(e);
+    return s->regs[shard]->send(std::move(rm));
   } catch (...) {
     return GB_ERR_INTERNAL;
   }

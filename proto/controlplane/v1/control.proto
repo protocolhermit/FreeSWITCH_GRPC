@@ -10,6 +10,12 @@ option go_package = "eswitch/engine/gen/controlplane/v1;controlplanev1";
 // The first NodeMessage on the stream MUST be Hello.
 service ControlPlane {
   rpc Connect(stream NodeMessage) returns (stream EngineMessage);
+  // Optional, registration-mode=engine only. After its HelloAck the node opens `shards` of these streams
+  // (registration-streams, default 1), each starting with RegStreamOpen; every RegEvent then travels on stream
+  // hash(user@domain) % shards instead of Connect, so registration traffic never queues ahead of calls and one
+  // AOR's events stay in order. An engine without this RPC answers UNIMPLEMENTED and keeps receiving RegEvents on
+  // Connect. The streams live and die with the node's Connect session; one ending ends the session.
+  rpc Registrations(stream RegStreamMessage) returns (stream RegStreamAck);
 }
 
 message NodeMessage {
@@ -176,6 +182,28 @@ message RegEvent {
   string user_agent = 9;
   string call_id = 10;
   bool resync = 11;
+}
+
+message RegStreamMessage {
+  oneof body {
+    RegStreamOpen open = 1; // first message, exactly once
+    RegEvent event = 2;
+  }
+}
+
+// Ties the stream to the node's live Connect session; the engine checks the token as it does Hello's.
+message RegStreamOpen {
+  string node_id = 1;
+  string token = 2;
+  string session_id = 3; // HelloAck.session_id
+  int32 shard = 4;       // 0 .. shards-1
+  int32 shards = 5;
+}
+
+// The engine's only message on the stream: accepted=false makes the node send RegEvents on Connect for this session.
+message RegStreamAck {
+  bool accepted = 1;
+  string reason = 2;
 }
 
 enum SuperviseModeKind {

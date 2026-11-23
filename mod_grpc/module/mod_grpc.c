@@ -2121,8 +2121,8 @@ SWITCH_STANDARD_API(grpc_api)
 		if (globals.reg_mode == TN_MODE_ENGINE) {
 			char last[32] = "never";
 			if (globals.reg_resync_last) switch_snprintf(last, sizeof(last), "%lld", (long long) globals.reg_resync_last);
-			switch_snprintf(regs, sizeof(regs), " reg_events_sent=%u reg_events_dropped=%u reg_resync_last=%s", globals.reg_events_sent,
-							globals.reg_events_dropped, last);
+			switch_snprintf(regs, sizeof(regs), " reg_streams=%d reg_events_sent=%u reg_events_dropped=%u reg_resync_last=%s",
+							gb_reg_streams(globals.bridge), globals.reg_events_sent, globals.reg_events_dropped, last);
 		}
 		switch_mutex_unlock(globals.state_mutex);
 		stream->write_function(stream, "node=%s endpoints=%s connected=%s draining=%s cache_entries=%u hits=%u stale_served=%u invalidated=%u survival=%s last=\"%s\" mode=%s tenancy=%s untrusted_tenant_headers=%u%s\n",
@@ -2685,6 +2685,13 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
 				int known;
 				globals.xf_mode = xf_fetch_mode(val, &known);
 				if (!known) switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "xml-dialplan-fetch %s unknown, using call\n", val);
+			}
+			else if (!strcasecmp(var, "registration-streams")) {
+				c.registration_streams = atoi(val);
+				if (c.registration_streams < 1 || c.registration_streams > GB_MAX_REG_STREAMS) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "registration-streams %s out of range 1-%d, using 1\n", val, GB_MAX_REG_STREAMS);
+					c.registration_streams = 1;
+				}
 			}
 			else if (!strcasecmp(var, "registration-mode")) {
 				if (!tn_parse_mode(val, &globals.reg_mode)) { mode_ok = 0; bad_val = switch_core_strdup(pool, val); }

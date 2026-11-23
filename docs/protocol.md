@@ -309,8 +309,9 @@ message RegEvent { Type type /* REGISTER=1 | UNREGISTER=2 | EXPIRE=3 */; string 
                    string user_agent; string call_id; bool resync; }
 ```
 
-Sent only in `engine` mode, as `NodeMessage.reg_event` (field 10).
-Fire-and-forget, no reply.
+Sent only in `engine` mode. Fire-and-forget, no reply. It travels on a
+`Registrations` stream when the engine implements that RPC (below), otherwise
+as `NodeMessage.reg_event` (field 10) on `Connect`.
 
 | Field | Meaning |
 |-------|---------|
@@ -329,7 +330,44 @@ up to sofia's late margin. A replay can also re-add a device that unregistered
 while the replay ran, so a live `UNREGISTER` (`resync=false`) should win over an
 older `resync` `REGISTER` for the same `call_id`.
 
-`RegEvent` is fire-and-forget. A live event that finds the node's send queue
+#### The `Registrations` streams
+
+```proto
+rpc Registrations(stream RegStreamMessage) returns (stream RegStreamAck);
+message RegStreamMessage { oneof body { RegStreamOpen open = 1; RegEvent event = 2; } }
+message RegStreamOpen    { string node_id; string token; string session_id; int32 shard; int32 shards; }
+message RegStreamAck     { bool accepted; string reason; }
+```
+
+Each stream has its own send queue on the node, and its own HTTP/2 flow
+control. A burst of registrations (a replay of thousands, or an engine that is
+slow to store them) therefore never waits ahead of, or fills the queue for,
+`RouteRequest` and `StepResult` on `Connect`.
+
+1. After an accepted `HelloAck`, and before it reports the stream up, a node in
+   `engine` mode opens `registration-streams` of these (default 1, at most 16).
+   Each sends `RegStreamOpen` first, with `shard` 0 to `shards-1` and the
+   `session_id` from the `HelloAck`.
+2. The engine checks `token` as it checks Hello's, and that `session_id` is
+   that node's live session. It then answers one `RegStreamAck` and sends
+   nothing more on the stream.
+3. The node sends each `RegEvent` on shard `hash(user@domain) % shards` (the
+   domain lowercased). All events for one address of record are on one
+   stream, in order. Different streams are not ordered relative to each other.
+   An engine may handle each stream on its own worker.
+4. The streams belong to the session. If one ends, the node closes the whole
+   session, reconnects, and replays. When the `Connect` stream ends, the node
+   closes them too.
+
+Fallback: when the engine answers `UNIMPLEMENTED` (it does not have the RPC),
+or `accepted=false`, or the stream fails before the ack, the node opens none
+for that session. `RegEvent`s then go on `Connect` as before. `grpc status`
+shows `reg_streams=0`. The whole exchange counts against `hello-timeout`.
+On `Connect`, a replayed event is refused while that queue is half full, so
+the replay always leaves room for calls.
+
+`RegEvent` is fire-and-forget. A live event that finds its send queue (the
+shard's, or `Connect`'s in fallback)
 full is lost, counted as `reg_events_dropped` in `grpc status`, and a replay is
 scheduled. The replay restores a lost `REGISTER`. A lost `UNREGISTER` or
 `EXPIRE` is not replayed, so that device stays until its `expires_s` runs out.

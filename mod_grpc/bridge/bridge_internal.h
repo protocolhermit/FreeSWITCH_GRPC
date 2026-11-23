@@ -52,6 +52,33 @@ struct Flight {
   Cache::Entry en;
 };
 
+// One Registrations stream (shard) of a session: its own bounded queue and writer, so RegEvents never wait in, or
+// fill, the queue that carries routes and steps. Created before the session reports up, closed with it.
+struct RegStream {
+  grpc::ClientContext ctx;
+  std::unique_ptr<grpc::ClientReaderWriter<cp::RegStreamMessage, cp::RegStreamAck>> stream;
+  std::mutex qm;
+  std::condition_variable qcv;
+  std::deque<cp::RegStreamMessage> q;
+  bool closed = false;
+  std::thread writer, reader;
+
+  // GB_OK, GB_ERR_DISCONNECTED or GB_ERR_QUEUE_FULL, as Session::send
+  int send(cp::RegStreamMessage&& m) {
+    std::lock_guard<std::mutex> l(qm);
+    if (closed) return GB_ERR_DISCONNECTED;
+    if (q.size() >= kMaxQueue) return GB_ERR_QUEUE_FULL;
+    q.push_back(std::move(m));
+    qcv.notify_one();
+    return GB_OK;
+  }
+  void close() {
+    std::lock_guard<std::mutex> l(qm);
+    closed = true;
+    qcv.notify_all();
+  }
+};
+
 // Everything that lives and dies with one stream.
 struct Session {
   grpc::ClientContext ctx;
@@ -67,24 +94,29 @@ struct Session {
   std::unordered_map<std::string, std::shared_ptr<Pending>> pending;
   bool dead = false;
 
-  bool push(cp::NodeMessage&& m) {
+  // Registrations shards; empty = RegEvents go on this stream. Filled before the session reports up, never resized.
+  std::vector<std::unique_ptr<RegStream>> regs;
+
+  // limit < kMaxQueue keeps headroom: a resync replayed on this stream must leave room for routes and steps
+  bool push(cp::NodeMessage&& m, size_t limit = kMaxQueue) {
     std::lock_guard<std::mutex> l(qm);
-    if (closed || q.size() >= kMaxQueue) return false;
+    if (closed || q.size() >= limit) return false;
     q.push_back(std::move(m));
     qcv.notify_one();
     return true;
   }
 
   // push for the fire-and-forget senders: GB_OK, GB_ERR_DISCONNECTED (stream closed) or GB_ERR_QUEUE_FULL
-  int send(cp::NodeMessage&& m) { return push(std::move(m)) ? GB_OK : closed_now() ? GB_ERR_DISCONNECTED : GB_ERR_QUEUE_FULL; }
+  int send(cp::NodeMessage&& m, size_t limit = kMaxQueue) { return push(std::move(m), limit) ? GB_OK : closed_now() ? GB_ERR_DISCONNECTED : GB_ERR_QUEUE_FULL; }
 
   bool closed_now() {
     std::lock_guard<std::mutex> l(qm);
     return closed;
   }
 
-  // Stops the writer and heartbeat threads and fails everything waiting.
+  // Stops the writer and heartbeat threads (and the shards' writers) and fails everything waiting.
   void close() {
+    for (auto& r : regs) r->close();
     {
       std::lock_guard<std::mutex> l(qm);
       closed = true;
@@ -109,6 +141,8 @@ struct gb_bridge {
   // configuration (owned copies)
   std::string endpoints, node_id, version, tags, tls_ca, tls_cert, tls_key, tls_server_name, sip_address, registration_mode;
   int32_t capacity = 0;
+  int reg_streams = 0;  // Registrations shards opened per session; 0 = none (not engine mode)
+  std::atomic<int> reg_active{0};  // shards of the live session; 0 = RegEvents on Connect
   int hello_timeout_ms = 10000, backoff_min_ms = 500, backoff_max_ms = 15000, keepalive_ms = 30000;
   gb_callbacks_t cb{};
   void* ud = nullptr;
@@ -147,6 +181,10 @@ struct gb_bridge {
   void run();
   bool connect_once(const std::string& endpoint);
   bool run_stream(const std::string& target, const std::string& host);
+  // Opens reg_streams Registrations shards on s; false (none kept) when the engine refuses or lacks the RPC.
+  bool open_regs(cp::ControlPlane::Stub* stub, const std::shared_ptr<gb::Session>& s, const std::string& session_id,
+                 const std::string& tok, std::mutex& wm);
+  void close_regs(const std::shared_ptr<gb::Session>& s);
   void dispatch(const std::shared_ptr<gb::Session>& s, const cp::EngineMessage& m);
   int call(cp::NodeMessage* m, int timeout_ms, cp::EngineMessage* reply);
 

@@ -85,7 +85,9 @@ typedef struct {
 	int survival_max_age_s;      /* 0 = 86400: how long a fetched snapshot may be served with no engine */
 	const char *sip_address;       /* host:port of this node's SIP profile, may be NULL */
 	const char *registration_mode; /* "engine" or "local"; NULL in edge mode */
+	int registration_streams;      /* engine mode: Registrations shards per session, 0 = 1, capped at GB_MAX_REG_STREAMS */
 } gb_config_t;
+#define GB_MAX_REG_STREAMS 16
 
 typedef struct {
 	const char *command_id;
@@ -267,8 +269,12 @@ typedef struct {
 	const char *user_agent, *call_id;
 	int resync;
 } gb_reg_event_t;
-/* GB_ERR_ARG on NULL or a bad type, otherwise as gb_send_call_event. */
+/* GB_ERR_ARG on NULL or a bad type, otherwise as gb_send_call_event. Goes on Registrations shard
+ * hash(user@domain) % n when the session has shards (each with its own queue), else on the Connect stream, where a
+ * resync event is refused (GB_ERR_QUEUE_FULL) once that queue is half full, leaving room for routes and steps. */
 int gb_send_reg_event(gb_bridge_t *b, const gb_reg_event_t *e);
+/* Registrations shards of the live session; 0 when RegEvents go on the Connect stream (or no session). */
+int gb_reg_streams(gb_bridge_t *b);
 /* Conference lifecycle events: type 1=recording done, 2=room ready. */
 int gb_send_conf_event(gb_bridge_t *b, int type, const char *tenant,
     const char *room, const char *rec_id, int64_t length_ms, int uploaded,

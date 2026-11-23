@@ -228,12 +228,16 @@ bool gb_bridge::run_stream(const std::string& target, const std::string& host) {
   for (auto& t : split(tags, ',')) h->add_tags(t);
 
   // The watchdog cancels the stream when no HelloAck arrives in time.
+  // It covers the Registrations opens too: those shards are in s->regs (appended under wm) by then.
   std::mutex wm;
   std::condition_variable wcv;
-  bool handshake_done = false;
+  bool handshake_done = false, timed_out = false;
   std::thread watchdog([&] {
     std::unique_lock<std::mutex> l(wm);
-    if (!wcv.wait_for(l, Ms(hello_timeout_ms), [&] { return handshake_done; })) s->ctx.TryCancel();
+    if (wcv.wait_for(l, Ms(hello_timeout_ms), [&] { return handshake_done; })) return;
+    timed_out = true;
+    s->ctx.TryCancel();
+    for (auto& r : s->regs) r->ctx.TryCancel();
   });
   auto finish_handshake = [&] {
     {
@@ -246,9 +250,13 @@ bool gb_bridge::run_stream(const std::string& target, const std::string& host) {
 
   cp::EngineMessage ack;
   bool got = s->stream->Write(hello) && s->stream->Read(&ack);
+  bool accepted = got && ack.has_hello_ack() && ack.hello_ack().accepted();
+  if (accepted && reg_streams > 0) open_regs(stub.get(), s, ack.hello_ack().session_id(), tok, wm);
   finish_handshake();
-  if (!got || !ack.has_hello_ack() || !ack.hello_ack().accepted()) {
+  if (!accepted || timed_out) {
     std::string reason = got && ack.has_hello_ack() ? ack.hello_ack().reason() : "";
+    if (accepted) reason = "no RegStreamAck in time";
+    close_regs(s);
     s->ctx.TryCancel();
     grpc::Status st = s->stream->Finish();
     if (reason.empty()) reason = st.error_message().empty() ? "no HelloAck" : st.error_message();
@@ -303,6 +311,7 @@ bool gb_bridge::run_stream(const std::string& target, const std::string& host) {
 
   s->close();
   s->ctx.TryCancel();
+  close_regs(s);
   writer.join();
   heartbeat.join();
   grpc::Status st = s->stream->Finish();
@@ -312,6 +321,96 @@ bool gb_bridge::run_stream(const std::string& target, const std::string& host) {
   }
   state(0, "stream ended: " + (st.error_message().empty() ? std::string("closed") : st.error_message()));
   return true;
+}
+
+bool gb_bridge::open_regs(cp::ControlPlane::Stub* stub, const std::shared_ptr<Session>& s, const std::string& session_id,
+                          const std::string& tok, std::mutex& wm) {
+  std::string why;
+  bool unimplemented = false;
+  for (int i = 0; i < reg_streams && why.empty(); i++) {
+    gb::RegStream* r;
+    {
+      auto owned = std::make_unique<gb::RegStream>();
+      r = owned.get();
+      std::lock_guard<std::mutex> l(wm);  // the watchdog walks s->regs; TryCancel before the call starts still cancels it
+      s->regs.push_back(std::move(owned));
+    }
+    r->stream = stub->Registrations(&r->ctx);
+    cp::RegStreamMessage open;
+    cp::RegStreamOpen* o = open.mutable_open();
+    o->set_node_id(node_id);
+    o->set_token(tok);
+    o->set_session_id(session_id);
+    o->set_shard(i);
+    o->set_shards(reg_streams);
+    cp::RegStreamAck ack;
+    if (r->stream->Write(open) && r->stream->Read(&ack)) {
+      if (!ack.accepted()) why = "refused: " + (ack.reason().empty() ? std::string("no reason") : ack.reason());
+      continue;
+    }
+    grpc::Status st = r->stream->Finish();
+    r->stream.reset();  // finished: close_regs must not Finish it again
+    unimplemented = st.error_code() == grpc::StatusCode::UNIMPLEMENTED;
+    why = unimplemented ? "the engine has no Registrations RPC" : st.error_message().empty() ? "stream closed" : st.error_message();
+  }
+  if (!why.empty()) {
+    close_regs(s);
+    {
+      std::lock_guard<std::mutex> l(wm);
+      s->regs.clear();
+    }
+    log(unimplemented ? GB_LOG_INFO : GB_LOG_WARN, "registration streams: %s; RegEvents go on the Connect stream", why.c_str());
+    return false;
+  }
+  for (size_t i = 0; i < s->regs.size(); i++) {
+    gb::RegStream* r = s->regs[i].get();
+    r->writer = std::thread([this, s, r, i] {
+      for (;;) {
+        cp::RegStreamMessage m;
+        {
+          std::unique_lock<std::mutex> l(r->qm);
+          r->qcv.wait(l, [&] { return r->closed || !r->q.empty(); });
+          if (r->closed) return;
+          m = std::move(r->q.front());
+          r->q.pop_front();
+        }
+        if (!r->stream->Write(m)) {
+          if (!s->closed_now()) log(GB_LOG_WARN, "registration stream %zu write failed: closing the session", i);
+          r->close();
+          s->ctx.TryCancel();  // the shards live and die with the session: reconnect and resync everything
+          return;
+        }
+      }
+    });
+    r->reader = std::thread([this, s, r, i] {
+      cp::RegStreamAck a;
+      while (r->stream->Read(&a)) {
+      }
+      if (!s->closed_now()) {
+        log(GB_LOG_WARN, "registration stream %zu ended: closing the session", i);
+        s->ctx.TryCancel();
+      }
+    });
+  }
+  reg_active = static_cast<int>(s->regs.size());
+  return true;
+}
+
+// Stops and finishes every shard of s. The vector is left as is: senders may still hold s.
+void gb_bridge::close_regs(const std::shared_ptr<Session>& s) {
+  for (auto& r : s->regs) {
+    r->close();
+    r->ctx.TryCancel();
+  }
+  for (auto& r : s->regs) {
+    if (r->writer.joinable()) r->writer.join();
+    if (r->reader.joinable()) r->reader.join();
+    if (r->stream) {
+      r->stream->Finish();
+      r->stream.reset();
+    }
+  }
+  reg_active = 0;
 }
 
 void gb_bridge::dispatch(const std::shared_ptr<Session>& s, const cp::EngineMessage& m) {
@@ -409,6 +508,8 @@ gb_bridge_t* gb_create(const gb_config_t* cfg, const gb_callbacks_t* cb, void* u
     b->boot_id = new_boot_id();
     b->sip_address = gb::str(cfg->sip_address);
     b->registration_mode = gb::str(cfg->registration_mode);
+    if (b->registration_mode == "engine")
+      b->reg_streams = cfg->registration_streams <= 0 ? 1 : std::min(cfg->registration_streams, GB_MAX_REG_STREAMS);
     b->tls_ca = gb::str(cfg->tls_ca);
     b->tls_cert = gb::str(cfg->tls_cert);
     b->tls_key = gb::str(cfg->tls_key);
@@ -476,5 +577,7 @@ void gb_destroy(gb_bridge_t* b) {
 }
 
 int gb_connected(gb_bridge_t* b) { return b && b->connected ? 1 : 0; }
+
+int gb_reg_streams(gb_bridge_t* b) { return b ? b->reg_active.load() : 0; }
 
 }  // extern "C"

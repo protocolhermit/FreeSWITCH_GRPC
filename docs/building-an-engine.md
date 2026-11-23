@@ -382,6 +382,54 @@ Nodes in `edge` or `local` mode send no `RegEvent`.
   change. The node also replays its live registrations after every reconnect,
   with `resync=true` (see [protocol.md](protocol.md) §6).
 
+### Serve the `Registrations` RPC
+
+Implement `Registrations`, so registration traffic stays off the `Connect`
+stream that carries calls. Without it, everything still works: the node falls
+back to sending `RegEvent` on `Connect`. But a replay of thousands of
+registrations then shares a queue with `RouteRequest`, and a slow
+registration handler delays calls.
+
+- Read the first message: it must be `open`. Check `token`, and check that
+  `session_id` is the live session of `node_id`. Answer
+  `RegStreamAck{accepted: true}`, or `false` with a `reason`.
+- Then read `event` messages until the stream ends. Give each stream its own
+  goroutine. Events for one user are always on the same stream, in order.
+  Don't reorder within a stream, for example by fanning one stream's events
+  out to a worker pool.
+- Close the node's registration streams when its `Connect` stream ends. The
+  node does the same, and it treats a closed registration stream as a lost
+  session: it reconnects and replays.
+- Pick the count on the node with `registration-streams`. 1 is enough for most
+  nodes. Raise it to 4–8 for nodes with tens of thousands of registrations,
+  when one goroutine storing to Redis can't keep up.
+
+```go
+func (e *engine) Registrations(st pb.ControlPlane_RegistrationsServer) error {
+	m, err := st.Recv()
+	if err != nil || m.GetOpen() == nil {
+		return status.Error(codes.InvalidArgument, "open first")
+	}
+	n := e.liveNode(m.GetOpen().NodeId, m.GetOpen().SessionId)
+	if n == nil || !e.tokenOK(n, m.GetOpen().Token) {
+		_ = st.Send(&pb.RegStreamAck{Accepted: false, Reason: "unknown session"})
+		return nil
+	}
+	if err := st.Send(&pb.RegStreamAck{Accepted: true}); err != nil {
+		return err
+	}
+	for {
+		m, err := st.Recv()
+		if err != nil {
+			return nil
+		}
+		if r := m.GetEvent(); r != nil {
+			e.onReg(st.Context(), n, r) // in order: no goroutine per event
+		}
+	}
+}
+```
+
 ### Store: one Redis hash per user
 
 Key `reg:{tenant}:{user}@{domain}`. One field per `call_id` (one per device),
@@ -467,7 +515,8 @@ type regInfo struct {
 
 func regKey(r *pb.RegEvent) string { return "reg:" + r.TenantId + ":" + r.User + "@" + r.Domain }
 
-// In the Recv loop: case *pb.NodeMessage_RegEvent: go e.onReg(ctx, n, b.RegEvent)
+// From Registrations (above), or on Connect for a node that fell back:
+// case *pb.NodeMessage_RegEvent: e.onReg(ctx, n, b.RegEvent)
 func (e *engine) onReg(ctx context.Context, n *node, r *pb.RegEvent) {
 	key := regKey(r)
 	switch r.Type {

@@ -126,6 +126,7 @@ Add `<load module="mod_grpc"/>` to `modules.conf.xml`, or run `load mod_grpc` fr
 | `survival-refresh` | `300` | Seconds between snapshot refreshes. |
 | `survival-max-age` | `86400` | Seconds a snapshot may be served without an engine. |
 | `registration-mode` | `edge` | `edge`: a SIP edge (Kamailio) holds registrations and sets `X-Tenant-Id`. `local`: this node's sofia holds registrations, the tenant comes from the domain. `engine`: like `local`, and the node also reports registrations to the engine. See §9. |
+| `registration-streams` | `1` | `engine` mode: how many `Registrations` streams carry registration events to the engine (1–16). Each user's events always use the same stream. Raise it for nodes with tens of thousands of registrations. An engine without that RPC gets them on the main stream instead (`reg_streams=0` in `grpc status`). |
 | `tenancy` | `multi` | `multi`: tenant per call. `single`: every call, lookup, and directory entry uses `default-tenant`. |
 | `default-tenant` | – | Tenant UUID. Required with `tenancy=single`. |
 | `tenant-header-acl` | – | FreeSWITCH ACL list the SIP source must pass for its `X-Tenant-Id` to be trusted. In `local` and `engine` mode no header is trusted without it. In `edge` mode it is optional: unset trusts the header, as before. The list is not checked at load beyond a warning (FreeSWITCH can't tell a missing list from a denied address). The check probes `127.0.0.1`, so a peers-only list (see §9) always logs this WARNING at load; that is expected. |
@@ -265,7 +266,8 @@ node=fs-01 endpoints=engine1:9443 connected=yes draining=no cache_entries=12 hit
 ```
 
 `mode`, `tenancy`, and `untrusted_tenant_headers` are always shown. In `engine`
-mode the line also ends with `reg_events_sent=<n> reg_events_dropped=<n> reg_resync_last=<unix time or never>`:
+mode the line also ends with `reg_streams=<n> reg_events_sent=<n> reg_events_dropped=<n> reg_resync_last=<unix time or never>`:
+the registration streams open (0: events go on the main stream),
 registration events sent, live events lost because the send queue was full,
 and when the last replay ran.
 
@@ -398,7 +400,9 @@ registrations as its own.
 - **Registrations.** `sofia::register`, `sofia::unregister`, and `sofia::expire`
   become `RegEvent`s. After the engine stream reconnects, the node replays
   its live registrations (from `sofia xmlstatus`) with `resync=true`.
-  A live event that finds the send queue full is dropped. The node counts it
+  They travel on their own `Registrations` streams (`registration-streams`),
+  so a replay never holds up calls. A live event that finds its send queue full
+  is dropped. The node counts it
   (`reg_events_dropped`), logs a WARNING at most every 10 s, and schedules a
   replay, which restores a lost `REGISTER`. A lost `UNREGISTER` or `EXPIRE` is
   not replayed: the engine keeps that device until its `expires_s` runs out.
