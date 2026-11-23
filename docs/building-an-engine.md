@@ -788,6 +788,8 @@ Listening:
    `ZRANGE vm:{t}:msgs:{user}:new (<last score> +inf BYSCORE LIMIT 0 10`, where
    `<last score>` is the score of the last message already read (the `(` makes
    it exclusive, so that message is not read twice), O(log n + 10). Keep that
-   score in the step state. Start with `-inf`.
+   score in the step state. Start with `-inf`. Scores must be unique per message (for example unix
+   microseconds, or break ties by also ordering on the message id), or messages
+   that share a score are skipped.
 3. Saving moves the id from `new` to `saved` (`ZREM` + `ZADD`), and deleting is
    `ZREM` + `DEL` of the message hash, all O(log n). Then update the lamp.

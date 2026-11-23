@@ -915,7 +915,7 @@ static void media_evict(const char *dir, const char *keep)
 		while ((e = readdir(d))) {
 			char p[1024];
 			struct stat st;
-			if (e->d_name[0] == '.' || strstr(e->d_name, ".tmp.")) continue;
+			if (!mf_is_cache_name(e->d_name)) continue; /* only our own files: a shared dir keeps the operator's */
 			if (snprintf(p, sizeof(p), "%s/%s", dir, e->d_name) >= (int) sizeof(p) || stat(p, &st) || !S_ISREG(st.st_mode)) continue;
 			total += st.st_size;
 			if (!strcmp(p, keep)) continue; /* the file about to be played is never a victim */
@@ -995,6 +995,11 @@ static switch_bool_t media_local(const char *url, char *out, size_t outlen, char
 	if (rc == CURLE_OK && (code < 200 || code > 299)) { /* FAILONERROR covers only >= 400: a 3xx or 204 must not be cached as media */
 		unlink(tmp);
 		switch_snprintf(err, errlen, "fetch: http %ld", code);
+		return SWITCH_FALSE;
+	}
+	if (rc == CURLE_OK && stat(tmp, &st) == 0 && st.st_size == 0) {
+		unlink(tmp);
+		switch_snprintf(err, errlen, "fetch: empty");
 		return SWITCH_FALSE;
 	}
 	if (rc != CURLE_OK) {

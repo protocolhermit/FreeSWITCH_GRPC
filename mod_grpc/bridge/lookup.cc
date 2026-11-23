@@ -172,6 +172,7 @@ int gb_data(gb_bridge_t* b, const gb_data_req_t* r, int timeout_ms, gb_data_res_
     cp::EngineMessage reply;
     int rc = b->call(&m, timeout_ms > 0 ? timeout_ms : 1500, &reply);
     if (rc != GB_OK) return rc;
+    if (reply.body_case() != cp::EngineMessage::kDataResponse) return GB_ERR_INTERNAL;
     const cp::DataResponse& dr = reply.data_response();
     out->version = dr.version();
     if (dr.unavailable()) return GB_ERR_UNAVAILABLE;
@@ -180,8 +181,12 @@ int gb_data(gb_bridge_t* b, const gb_data_req_t* r, int timeout_ms, gb_data_res_
       std::snprintf(out->error, sizeof out->error, "%s", dr.error().c_str());
       return GB_ERR_ENGINE;
     }
+    if (!dr.ok()) return GB_ERR_UNAVAILABLE;
     if (r->op == GB_DATA_GET && !dr.found()) return GB_ERR_NOT_FOUND;
-    if (r->op == GB_DATA_GET || r->op == GB_DATA_INCR) out->value = dup_bytes(dr.value());
+    if (r->op == GB_DATA_GET || r->op == GB_DATA_INCR) {
+      out->value = dup_bytes(dr.value());
+      if (!out->value) return GB_ERR_INTERNAL;
+    }
     return GB_OK;
   } catch (...) {
     return GB_ERR_INTERNAL;

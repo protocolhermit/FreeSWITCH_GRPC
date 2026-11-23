@@ -60,6 +60,14 @@ static inline int mf_url_ok(const char *url, const char *hosts)
 	return 0;
 }
 
+/* True for exactly an mf_cache_name shape: 16 lowercase hex digits then .wav, .mp3 or .ogg. */
+static inline int mf_is_cache_name(const char *n)
+{
+	int i;
+	for (i = 0; i < 16; i++) if (!((n[i] >= '0' && n[i] <= '9') || (n[i] >= 'a' && n[i] <= 'f'))) return 0;
+	return !strcmp(n + 16, ".wav") || !strcmp(n + 16, ".mp3") || !strcmp(n + 16, ".ogg");
+}
+
 /* "<16 hex of FNV-1a 64 of host+path>.<ext>" for an mf_url_ok url; 0 when it does not fit. */
 static inline int mf_cache_name(const char *url, char *out, size_t outlen)
 {
