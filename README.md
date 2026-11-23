@@ -34,3 +34,7 @@ cd mod_grpc
 cmake -S . -B build-fs -G Ninja -DFS_PREFIX=/usr/local/freeswitch
 cmake --build build-fs && sudo cmake --install build-fs
 ```
+
+## License
+
+Copyright (C) 2026 Protocol Hermit. Licensed under the GNU General Public License, version 3 or (at your option) any later version. See [LICENSE](LICENSE).

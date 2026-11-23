@@ -1,3 +1,21 @@
+/*
+ * mod_grpc: FreeSWITCH control-plane module (gRPC)
+ * Copyright (C) 2026 Protocol Hermit
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /* Survival-mode routing decision for mod_grpc. Plain C with no FreeSWITCH dependency so the unit tests can include it.
  * The includer provides cJSON (switch.h in the module, <cjson/cJSON.h> in the tests) and dial_guard.h first.
  *
