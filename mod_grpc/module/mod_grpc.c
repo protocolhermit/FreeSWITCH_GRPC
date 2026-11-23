@@ -324,7 +324,8 @@ static switch_bool_t exec_originate(const cmd_item_t *c, char *err, size_t errle
 			switch_snprintf(err, errlen, "originate: variable %s not allowed on a routed leg", c->keys[i]);
 			return SWITCH_FALSE;
 		}
-		if (!strcmp(c->keys[i], "tenant_id") || !strcasecmp(c->keys[i], "sip_h_X-Tenant-Id")) continue; /* the command's tenant wins */
+		/* the command's tenant wins; channel variable names are case-insensitive, so TENANT_ID must not override it */
+		if (!strcasecmp(c->keys[i], "tenant_id") || !strcasecmp(c->keys[i], "sip_h_X-Tenant-Id")) continue;
 		if (!sappend(args, sizeof(args), &n, ",%s='%s'", c->keys[i], c->values[i])) goto too_long;
 	}
 	if (!sappend(args, sizeof(args), &n, "}%s %s", c->dial_string, routed ? "&grpc_route()" : "&park()")) goto too_long;
@@ -509,10 +510,13 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 			return SWITCH_FALSE;
 		}
 		return run_api("uuid_broadcast", args, err, errlen);
-	case GB_CMD_HANGUP:
-		/* the canonical name, never the engine's text: an unknown cause is NORMAL_CLEARING, as on the inline path */
-		switch_snprintf(args, sizeof(args), "%s %s", c->uuid, switch_channel_cause2str(switch_channel_str2cause(c->cause)));
+	case GB_CMD_HANGUP: {
+		/* the canonical name, never the engine's text: an empty or unknown cause is NORMAL_CLEARING, as on the inline path
+		 * (str2cause gives NONE for those, and uuid_kill would hang up with NONE) */
+		switch_call_cause_t cause = switch_channel_str2cause(c->cause);
+		switch_snprintf(args, sizeof(args), "%s %s", c->uuid, switch_channel_cause2str(cause ? cause : SWITCH_CAUSE_NORMAL_CLEARING));
 		return run_api("uuid_kill", args, err, errlen);
+	}
 	case GB_CMD_SUPERVISE_MODE: {
 		char digit = sg_supervise_mode_dtmf(c->mode);
 		switch_core_session_t *s;
