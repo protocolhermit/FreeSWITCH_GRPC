@@ -43,8 +43,9 @@ static inline int sg_safe_prompt(const char *v, const char *record_dir, const ch
 	for (p = v; (p = strstr(p, "//")); p++)
 		if (p == v || p[-1] != ':') return 0;
 	/* only the generated-audio schemes the engine sends: shell_stream:// runs commands, http:// reaches internal hosts,
-	 * file_string:// chains files */
-	if ((p = strstr(v, "://")) && ((strncmp(v, "silence_stream://", 17) && strncmp(v, "tone_stream://", 14)) || strstr(p + 3, "://")))
+	 * file_string:// chains files. local_stream:// names a configured hold-music stream, so its name must be one safe component */
+	if ((p = strstr(v, "://")) && ((strncmp(v, "silence_stream://", 17) && strncmp(v, "tone_stream://", 14) &&
+			(strncmp(v, "local_stream://", 15) || !sg_safe_name(v + 15))) || strstr(p + 3, "://")))
 		return 0;
 	while (dn > 1 && record_dir[dn - 1] == '/') dn--;
 	if (dn < 2) return 1; /* no record dir configured */
