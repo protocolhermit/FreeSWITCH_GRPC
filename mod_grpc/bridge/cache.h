@@ -110,7 +110,7 @@ class Cache {
     size_t dropped = 0;
     if (key != "*" && kind != 0) {  // one exact entry: the index finds it, no scan of every entry under the lock
       auto it = index_.find(make_id(tenant, kind, key));
-      if (it != index_.end() && it->second->e.version < version) {
+      if (it != index_.end() && (version == 0 || it->second->e.version < version)) {  // version 0 = unversioned: drop
         list_of(*it->second).erase(it->second);
         index_.erase(it);
         dropped = 1;
@@ -121,7 +121,7 @@ class Cache {
     for (auto* l : {&lru_, &pinned_})
       for (auto it = l->begin(); it != l->end();) {
         bool match = it->tenant == tenant && (kind == 0 || it->kind == kind) && (key == "*" || it->key == key) &&
-                     it->e.version < version;
+                     (version == 0 || it->e.version < version);
         if (match) {
           index_.erase(it->id);
           it = l->erase(it);

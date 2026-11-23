@@ -53,6 +53,7 @@ int gb_bridge::fetch(const std::string& tenant, int kind, const std::string& key
   cp::EngineMessage reply;
   int rc = call(&m, timeout_ms, &reply);
   if (rc != GB_OK) return rc;
+  if (reply.body_case() != cp::EngineMessage::kLookupResponse) return GB_ERR_INTERNAL;  // never cache a default message
   const cp::LookupResponse& lr = reply.lookup_response();
   *unavailable = lr.unavailable();  // a backend failure is not "not found": never cache it
   if (*unavailable) return GB_OK;

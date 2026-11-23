@@ -257,6 +257,7 @@ int gb_route(gb_bridge_t* b, const gb_route_request_t* req, int timeout_ms, gb_r
     cp::EngineMessage reply;
     int rc = b->call(&m, timeout_ms > 0 ? timeout_ms : 2000, &reply);
     if (rc != GB_OK) return rc;
+    if (reply.body_case() != cp::EngineMessage::kRouteResponse) return GB_ERR_INTERNAL;
     rc = export_commands(reply.route_response(), out);
     if (rc != GB_OK) gb_route_result_free(out);
     return rc;
@@ -326,6 +327,7 @@ int gb_step(gb_bridge_t* b, const gb_step_result_t* s, int timeout_ms, gb_route_
     cp::EngineMessage reply;
     int rc = b->call(&m, timeout_ms > 0 ? timeout_ms : 3000, &reply);
     if (rc != GB_OK) return rc;
+    if (reply.body_case() != cp::EngineMessage::kRouteResponse) return GB_ERR_INTERNAL;
     rc = export_commands(reply.route_response(), out);
     if (rc != GB_OK) gb_route_result_free(out);
     return rc;
