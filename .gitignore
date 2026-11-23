@@ -1,5 +1,7 @@
 # build output
 mod_grpc/build-fs/
+mod_grpc/build-sa/
+mod_grpc/build-unit/
 build*/
 
 # test sources are kept local, not pushed
