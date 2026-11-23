@@ -120,13 +120,16 @@ std::shared_ptr<Session> gb_bridge::current() {
 
 void gb_bridge::run() {
   std::vector<std::string> eps = split(endpoints, ',');
-  size_t idx = 0;
+  size_t idx = 0, untried = 0;
   int backoff = backoff_min_ms;
   std::minstd_rand rng(std::random_device{}());
   while (!stopping()) {
     auto t0 = std::chrono::steady_clock::now();
     bool established = !eps.empty() && connect_once(eps[idx++ % eps.size()]);
     if (stopping()) break;
+    // A failed endpoint with others still untried: try the next one at once, not after a backoff
+    if (!established && eps.size() > 1 && ++untried < eps.size()) continue;
+    untried = 0;
     // A stream that ended within a minute is a flap, not a recovery: keep backing off.
     bool lasted = established && std::chrono::steady_clock::now() - t0 >= std::chrono::seconds(60);
     backoff = lasted ? backoff_min_ms : std::min(backoff * 2, backoff_max_ms);

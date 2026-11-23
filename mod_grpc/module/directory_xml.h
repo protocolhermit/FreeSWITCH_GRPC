@@ -62,6 +62,8 @@ static inline int dx_user_xml(const dx_user_t *u, char *out, size_t outlen)
 	dx_buf_t b = {out, outlen, 1};
 	size_t i;
 	if (!u || !out || !outlen || !u->domain || !u->user || !u->tenant) return 0;
+	/* user is the caller's SIP user and lands in effective_caller_id_number: no "${" (see ag_no_api_expansion) */
+	if (!ag_no_api_expansion(u->user) || !ag_no_api_expansion(u->domain)) return 0;
 	dx_raw(&b, "<document type=\"freeswitch/xml\"><section name=\"directory\"><domain name=\"");
 	dx_esc(&b, u->domain);
 	dx_raw(&b, "\">");

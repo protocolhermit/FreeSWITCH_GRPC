@@ -154,7 +154,7 @@ static inline int sg_conf_flags(char *out, size_t n, int mute, int moderator, in
 	return w > 0 && (size_t) w < n;
 }
 
-enum { SG_CONF_MUTE = 1, SG_CONF_UNMUTE, SG_CONF_MUTE_ALL, SG_CONF_UNMUTE_ALL, SG_CONF_KICK, SG_CONF_LOCK, SG_CONF_UNLOCK, SG_CONF_END };
+enum { SG_CONF_MUTE = 1, SG_CONF_UNMUTE, SG_CONF_MUTE_ALL, SG_CONF_UNMUTE_ALL, SG_CONF_KICK, SG_CONF_LOCK, SG_CONF_UNLOCK, SG_CONF_END, SG_CONF_RECORD_START, SG_CONF_RECORD_STOP };
 
 /* A FreeSWITCH conference member id: decimal digits only, so "all", "last" and "non_moderator" can never come from a caller. */
 static inline int sg_conf_member_id(const char *v)

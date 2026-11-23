@@ -32,6 +32,8 @@ extern "C" {
 #define GB_SURVIVAL_KEY "survival"
 
 /* values match controlplane.v1.CallEventType */
+#define GB_CONF_RECORDING_DONE 1 /* ConfEvent.Type */
+#define GB_CONF_ROOM_READY 2
 #define GB_EVT_CREATED 1
 #define GB_EVT_ANSWERED 2
 #define GB_EVT_DTMF 3

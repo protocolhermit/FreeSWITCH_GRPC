@@ -305,9 +305,9 @@ static switch_bool_t exec_originate(const cmd_item_t *c, char *err, size_t errle
 	size_t i, n = 0;
 	const int routed = c->route_on_answer;
 	/* the tenant goes unquoted into {tenant_id=...}: a ',' would start a variable of the engine's choosing */
-	if (!zstr(c->peer_tenant_id) || !zstr(c->peer_caller_id) || !c->tenant_id[0] || !safe_value(c->tenant_id) || strchr(c->tenant_id, ',') ||
+	if (!zstr(c->peer_tenant_id) || !zstr(c->peer_caller_id) || !dg_uuid_shaped(c->tenant_id) || /* tenant ids are UUIDs: nothing else goes unquoted into {tenant_id=...} */
 		!safe_dial(c->dial_string, NULL) ||
-		(routed && (!dg_uuid_shaped(c->tenant_id) || !dg_single_leg(c->dial_string)))) {
+		(routed && !dg_single_leg(c->dial_string))) {
 		switch_snprintf(err, errlen, "originate: bad tenant or dial string");
 		return SWITCH_FALSE;
 	}
@@ -361,7 +361,7 @@ static switch_bool_t exec_conference_control(const cmd_item_t *c, char *err, siz
 		return SWITCH_FALSE;
 	}
 	/* 9 = RECORD_START, 10 = RECORD_STOP. Before sg_conf_control, which has no recording arm. */
-	if (c->conf_action == 9 || c->conf_action == 10) return exec_conf_record(c, room, err, errlen);
+	if (c->conf_action == SG_CONF_RECORD_START || c->conf_action == SG_CONF_RECORD_STOP) return exec_conf_record(c, room, err, errlen);
 	/* End kicks everyone, but the known recording stops by its saved path first. The job stays until upload. */
 	if (c->conf_action == SG_CONF_END) cr_end_stop(room);
 	if (c->conf_action == SG_CONF_MUTE || c->conf_action == SG_CONF_UNMUTE || c->conf_action == SG_CONF_KICK) {
@@ -1159,7 +1159,7 @@ static void cr_send_done(const char *tenant, const char *room, const char *rec_i
 {
 	int rc;
 	if (length_ms < 0) length_ms = 0;
-	rc = gb_send_conf_event(globals.bridge, 1 /* RECORDING_DONE */, tenant, room, rec_id, length_ms, uploaded, "", "");
+	rc = gb_send_conf_event(globals.bridge, GB_CONF_RECORDING_DONE, tenant, room, rec_id, length_ms, uploaded, "", "");
 	if (rc != GB_OK)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "conference recording %s completion not sent; recovery left to the pending sweep\n", rec_id ? rec_id : "");
 }
@@ -1467,7 +1467,7 @@ static switch_bool_t exec_conf_record_start(const cmd_item_t *c, const char *con
 
 static switch_bool_t exec_conf_record(const cmd_item_t *c, const char *conf, char *err, size_t errlen)
 {
-	if (c->conf_action == 10) return exec_conf_record_stop(c, conf, err, errlen);
+	if (c->conf_action == SG_CONF_RECORD_STOP) return exec_conf_record_stop(c, conf, err, errlen);
 	return exec_conf_record_start(c, conf, err, errlen);
 }
 
@@ -1522,7 +1522,7 @@ static void cr_on_add_member(switch_event_t *event)
 	cr_copy(ucopy, sizeof(ucopy), uuid);
 	cr_copy(icopy, sizeof(icopy), inst ? inst : "");
 	switch_core_session_rwunlock(s);
-	gb_send_conf_event(globals.bridge, 2 /* ROOM_READY */, tcopy, rcopy, "", 0, 0, ucopy, icopy);
+	gb_send_conf_event(globals.bridge, GB_CONF_ROOM_READY, tcopy, rcopy, "", 0, 0, ucopy, icopy);
 }
 
 static void cr_maint_event(switch_event_t *event)
