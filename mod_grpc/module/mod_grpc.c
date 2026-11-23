@@ -861,7 +861,7 @@ static size_t media_write(char *buf, size_t sz, size_t cnt, void *ud)
 
 /* Deletes the oldest cached files (by mtime) until the directory is within media-cache-max.
  * ponytail: one directory scan per eviction, O(files) each; fine for thousands of files, an index is the upgrade. */
-static void media_evict(const char *dir)
+static void media_evict(const char *dir, const char *keep)
 {
 	int pass;
 	for (pass = 0; pass < 64; pass++) {
@@ -877,6 +877,7 @@ static void media_evict(const char *dir)
 			if (e->d_name[0] == '.' || strstr(e->d_name, ".tmp.")) continue;
 			if (snprintf(p, sizeof(p), "%s/%s", dir, e->d_name) >= (int) sizeof(p) || stat(p, &st) || !S_ISREG(st.st_mode)) continue;
 			total += st.st_size;
+			if (!strcmp(p, keep)) continue; /* the file about to be played is never a victim */
 			if (!victim[0] || st.st_mtime < oldest) { oldest = st.st_mtime; strcpy(victim, p); }
 		}
 		closedir(d);
@@ -938,6 +939,11 @@ static switch_bool_t media_local(const char *url, char *out, size_t outlen, char
 	curl_easy_getinfo(cu, CURLINFO_RESPONSE_CODE, &code);
 	curl_easy_cleanup(cu);
 	if (fclose(sink.fp) != 0 && rc == CURLE_OK) rc = CURLE_WRITE_ERROR;
+	if (rc == CURLE_OK && (code < 200 || code > 299)) { /* FAILONERROR covers only >= 400: a 3xx or 204 must not be cached as media */
+		unlink(tmp);
+		switch_snprintf(err, errlen, "fetch: http %ld", code);
+		return SWITCH_FALSE;
+	}
 	if (rc != CURLE_OK) {
 		unlink(tmp);
 		if (sink.too_large || rc == CURLE_FILESIZE_EXCEEDED) switch_snprintf(err, errlen, "fetch: too large");
@@ -954,7 +960,7 @@ static switch_bool_t media_local(const char *url, char *out, size_t outlen, char
 	switch_mutex_lock(globals.state_mutex);
 	globals.media_fetches++;
 	switch_mutex_unlock(globals.state_mutex);
-	media_evict(globals.media_cache_dir);
+	media_evict(globals.media_cache_dir, out);
 	return SWITCH_TRUE;
 }
 
@@ -3014,6 +3020,10 @@ static switch_status_t load_impl(switch_loadable_module_interface_t **module_int
 	if (!zstr(globals.tenant_header_acl) && !switch_check_network_list_ip("127.0.0.1", globals.tenant_header_acl))
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "mod_grpc: tenant-header-acl %s denies 127.0.0.1 or does not exist; if it does not exist no tenant header is trusted in local/engine mode\n", globals.tenant_header_acl);
 	if (zstr(globals.peer_profile)) globals.peer_profile = "internal";
+	if (globals.media_cache_max < globals.media_max_bytes) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "media-cache-max below media-max-bytes, raised to %lld\n", (long long) globals.media_max_bytes);
+		globals.media_cache_max = globals.media_max_bytes;
+	}
 	if (zstr(globals.media_cache_dir)) globals.media_cache_dir = switch_core_sprintf(pool, "%s/grpc-media", SWITCH_GLOBAL_dirs.storage_dir);
 	globals.directory_auth = dir_auth_set >= 0 ? dir_auth_set : (globals.reg_mode != TN_MODE_EDGE);
 	if (globals.reg_mode != TN_MODE_EDGE && !globals.directory_auth)
