@@ -17,6 +17,9 @@ extern "C" {
 #define GB_ERR_TIMEOUT (-3)
 #define GB_ERR_QUEUE_FULL (-4)
 #define GB_ERR_UNAVAILABLE (-5) /* the engine answered "cannot serve right now" */
+#define GB_ERR_CONFLICT (-6)
+#define GB_ERR_NOT_FOUND (-7)
+#define GB_ERR_ENGINE (-8) /* the engine answered ok=false with error set (e.g. not_integer) */
 #define GB_ERR_INTERNAL (-9)
 
 /* values match controlplane.v1.LookupKind */
@@ -59,6 +62,32 @@ extern "C" {
 #define GB_LOG_DEBUG 3
 
 typedef struct gb_bridge gb_bridge_t;
+
+#define GB_DATA_GET 1
+#define GB_DATA_SET 2
+#define GB_DATA_DEL 3
+#define GB_DATA_INCR 4
+#define GB_DATA_CAS 5
+typedef struct {
+  const char *tenant_id, *key, *value;
+  int op;
+  int32_t ttl_s;
+  int64_t delta, expect_version;
+} gb_data_req_t;
+typedef struct {
+  char *value; /* malloc'd or NULL */
+  int64_t version;
+  char error[64];
+} gb_data_res_t;
+/* One uncached round trip to the engine's data API. GB_OK (out->version, out->value for GET/INCR); GB_ERR_NOT_FOUND (get);
+ * GB_ERR_CONFLICT (out->version = current); GB_ERR_UNAVAILABLE; GB_ERR_ENGINE (out->error); GB_ERR_TIMEOUT;
+ * GB_ERR_DISCONNECTED; GB_ERR_ARG (NULL or bad op). Never touches the cache. */
+int gb_data(gb_bridge_t *b, const gb_data_req_t *r, int timeout_ms, gb_data_res_t *out);
+void gb_data_res_free(gb_data_res_t *r);
+/* 1 when the live session's HelloAck listed the feature */
+int gb_has_feature(gb_bridge_t *b, const char *name);
+/* comma-joined features of the live session ("" with none); returns the length written */
+size_t gb_features(gb_bridge_t *b, char *out, size_t outlen);
 
 typedef struct {
 	const char *key;

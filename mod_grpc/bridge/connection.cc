@@ -268,6 +268,10 @@ bool gb_bridge::run_stream(const std::string& target, const std::string& host) {
     return false;
   }
 
+  {
+    std::lock_guard<std::mutex> l(s->fm_);
+    s->features.assign(ack.hello_ack().features().begin(), ack.hello_ack().features().end());
+  }
   cache.expire_all();  // Invalidates sent while we were away never arrived: refetch rather than trust old entries
   int hb_s = ack.hello_ack().heartbeat_interval_s() > 0 ? ack.hello_ack().heartbeat_interval_s() : 5;
   state(1, "session " + ack.hello_ack().session_id());
@@ -416,6 +420,7 @@ void gb_bridge::close_regs(const std::shared_ptr<Session>& s) {
 void gb_bridge::dispatch(const std::shared_ptr<Session>& s, const cp::EngineMessage& m) {
   switch (m.body_case()) {
     case cp::EngineMessage::kLookupResponse:
+    case cp::EngineMessage::kDataResponse:
     case cp::EngineMessage::kRouteResponse: {
       std::shared_ptr<Pending> p;
       {

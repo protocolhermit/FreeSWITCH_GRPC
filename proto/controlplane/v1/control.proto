@@ -30,6 +30,7 @@ message NodeMessage {
     StepResult step_result = 8; // answered with a RouteResponse carrying the next batch
     ConfEvent conf_event = 9;
     RegEvent reg_event = 10;
+    DataRequest data_request = 11;
   }
 }
 
@@ -42,6 +43,7 @@ message EngineMessage {
     RouteResponse route_response = 5;
     Command command = 6;
     TokenRotate token_rotate = 7;
+    DataResponse data_response = 8;
   }
 }
 
@@ -64,6 +66,37 @@ message HelloAck {
   string reason = 2;
   string session_id = 3;
   int32 heartbeat_interval_s = 4;
+  // Optional capabilities this engine serves, e.g. "data", "mwi", "media_url". Absent = none.
+  repeated string features = 5;
+}
+
+// Tenant-scoped key/value API behind the node's `grpc data` command. Never cached on the node.
+message DataRequest {
+  enum Op {
+    UNSPECIFIED = 0;
+    GET = 1;
+    SET = 2;
+    DEL = 3;
+    INCR = 4;
+    CAS = 5;
+  }
+  string tenant_id = 1;
+  Op op = 2;
+  string key = 3;
+  string value = 4;
+  int32 ttl_s = 5;
+  int64 delta = 6;
+  int64 expect_version = 7;
+}
+
+message DataResponse {
+  bool ok = 1;
+  bool found = 2;        // GET
+  bool conflict = 3;     // CAS: version is the current one (0 = absent)
+  bool unavailable = 4;  // the engine could not reach its store
+  string value = 5;      // GET, INCR (the new integer)
+  int64 version = 6;
+  string error = 7;      // ok=false: not_integer, too_large, ...
 }
 
 message Heartbeat {

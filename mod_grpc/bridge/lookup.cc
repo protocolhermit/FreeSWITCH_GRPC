@@ -1,5 +1,6 @@
 // Cached lookups and Invalidate handling.
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -152,6 +153,74 @@ int gb_fetch(gb_bridge_t* b, const char* tenant, int kind, const char* key, cons
     return GB_OK;
   } catch (...) {
     return GB_ERR_INTERNAL;
+  }
+}
+
+int gb_data(gb_bridge_t* b, const gb_data_req_t* r, int timeout_ms, gb_data_res_t* out) {
+  try {
+    if (!b || !r || !out || !r->tenant_id || !r->key || r->op < GB_DATA_GET || r->op > GB_DATA_CAS) return GB_ERR_ARG;
+    std::memset(out, 0, sizeof *out);
+    cp::NodeMessage m;
+    cp::DataRequest* d = m.mutable_data_request();
+    d->set_tenant_id(r->tenant_id);
+    d->set_op(static_cast<cp::DataRequest::Op>(r->op));
+    d->set_key(r->key);
+    if (r->value) d->set_value(r->value);
+    d->set_ttl_s(r->ttl_s);
+    d->set_delta(r->delta);
+    d->set_expect_version(r->expect_version);
+    cp::EngineMessage reply;
+    int rc = b->call(&m, timeout_ms > 0 ? timeout_ms : 1500, &reply);
+    if (rc != GB_OK) return rc;
+    const cp::DataResponse& dr = reply.data_response();
+    out->version = dr.version();
+    if (dr.unavailable()) return GB_ERR_UNAVAILABLE;
+    if (dr.conflict()) return GB_ERR_CONFLICT;
+    if (!dr.ok() && !dr.error().empty()) {
+      std::snprintf(out->error, sizeof out->error, "%s", dr.error().c_str());
+      return GB_ERR_ENGINE;
+    }
+    if (r->op == GB_DATA_GET && !dr.found()) return GB_ERR_NOT_FOUND;
+    if (r->op == GB_DATA_GET || r->op == GB_DATA_INCR) out->value = dup_bytes(dr.value());
+    return GB_OK;
+  } catch (...) {
+    return GB_ERR_INTERNAL;
+  }
+}
+
+void gb_data_res_free(gb_data_res_t* r) {
+  if (!r) return;
+  std::free(r->value);
+  r->value = nullptr;
+}
+
+int gb_has_feature(gb_bridge_t* b, const char* name) {
+  try {
+    if (!b || !name) return 0;
+    auto s = b->current();
+    if (!s) return 0;
+    std::lock_guard<std::mutex> l(s->fm_);
+    return std::find(s->features.begin(), s->features.end(), name) != s->features.end();
+  } catch (...) {
+    return 0;
+  }
+}
+
+size_t gb_features(gb_bridge_t* b, char* out, size_t outlen) {
+  if (!out || !outlen) return 0;
+  out[0] = 0;
+  try {
+    auto s = b ? b->current() : nullptr;
+    if (!s) return 0;
+    std::string j;
+    {
+      std::lock_guard<std::mutex> l(s->fm_);
+      for (auto& f : s->features) j += (j.empty() ? "" : ",") + f;
+    }
+    std::snprintf(out, outlen, "%s", j.c_str());
+    return std::strlen(out);
+  } catch (...) {
+    return 0;
   }
 }
 

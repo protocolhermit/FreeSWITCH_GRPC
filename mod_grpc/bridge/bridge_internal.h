@@ -94,6 +94,9 @@ struct Session {
   std::unordered_map<std::string, std::shared_ptr<Pending>> pending;
   bool dead = false;
 
+  std::mutex fm_;  // guards features
+  std::vector<std::string> features;  // HelloAck.features, set before the session reports up
+
   // Registrations shards; empty = RegEvents go on this stream. Filled before the session reports up, never resized.
   std::vector<std::unique_ptr<RegStream>> regs;
 
