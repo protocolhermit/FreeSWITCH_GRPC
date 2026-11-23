@@ -784,7 +784,8 @@ Listening:
 
 1. `Collect` the PIN, then compare with the stored hash.
 2. Run the menu as a multi-step call: `Collect` for the choice, then `Playback`
-   with a presigned `url` for the message, and `ZRANGE` of the `new` set with a
-   small `LIMIT`, O(log n + page), for the next one.
+   with a presigned `url` for the message, and `ZRANGE vm:{t}:msgs:{user}:new 0 9` for
+   the next page of ids, O(log n + 10). To page by time instead, use
+   `ZRANGE ... BYSCORE <from> +inf LIMIT 0 10`.
 3. Saving moves the id from `new` to `saved` (`ZREM` + `ZADD`), and deleting is
    `ZREM` + `DEL` of the message hash, all O(log n). Then update the lamp.
