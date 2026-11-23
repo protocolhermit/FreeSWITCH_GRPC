@@ -33,6 +33,9 @@ static inline int da_value_ok(const char *value)
 	return 1;
 }
 
+/* a value over DA_MAX_VALUE bytes answers too_large, checked before da_value_ok */
+static inline int da_too_large(const char *value) { return value && strlen(value) > DA_MAX_VALUE; }
+
 /* next space-delimited token (non-empty); *s moves past the delimiter; *delim says whether a delimiter was there */
 static inline char *da_tok(char **s, int *delim)
 {

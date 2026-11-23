@@ -2131,21 +2131,26 @@ SWITCH_STANDARD_API(grpc_api)
 
 	if (zstr(cmd)) goto usage;
 	if (!strncmp(cmd, "data ", 5)) { /* the value keeps its spaces, so this is not split with the others */
-		char line[DA_MAX_VALUE + 512], reply[DA_MAX_VALUE + 128];
+		char *line, *reply;
+		size_t rlen;
 		da_cmd_t c;
 		gb_data_req_t rq;
 		gb_data_res_t rs;
 		int rc;
-		if (strlen(cmd) - 5 >= sizeof line) { stream->write_function(stream, "-ERR too_large\n"); return SWITCH_STATUS_SUCCESS; }
-		strcpy(line, cmd + 5);
+		/* heap, not stack: this can run on a call's session thread, whose stack is small */
+		if (strlen(cmd) - 5 > DA_MAX_VALUE + 512) { stream->write_function(stream, "-ERR too_large\n"); return SWITCH_STATUS_SUCCESS; }
+		if (!(line = strdup(cmd + 5))) { stream->write_function(stream, "-ERR unavailable\n"); return SWITCH_STATUS_SUCCESS; }
 		if (!da_parse(line, &c) || (globals.tenancy_single && (zstr(globals.default_tenant) || strcmp(c.tenant, globals.default_tenant))) ||
-			!da_key_ok(c.key) || (c.value && !da_value_ok(c.value))) {
+			!da_key_ok(c.key)) {
 			stream->write_function(stream, "-ERR bad_args\n");
+			free(line);
 			return SWITCH_STATUS_SUCCESS;
 		}
-		if (c.value && strlen(c.value) > DA_MAX_VALUE) { stream->write_function(stream, "-ERR too_large\n"); return SWITCH_STATUS_SUCCESS; }
+		if (da_too_large(c.value)) { stream->write_function(stream, "-ERR too_large\n"); free(line); return SWITCH_STATUS_SUCCESS; }
+		if (c.value && !da_value_ok(c.value)) { stream->write_function(stream, "-ERR bad_args\n"); free(line); return SWITCH_STATUS_SUCCESS; }
 		if (!gb_has_feature(globals.bridge, "data")) {
 			stream->write_function(stream, gb_connected(globals.bridge) ? "-ERR unsupported\n" : "-ERR disconnected\n");
+			free(line);
 			return SWITCH_STATUS_SUCCESS;
 		}
 		memset(&rq, 0, sizeof rq);
@@ -2153,13 +2158,17 @@ SWITCH_STANDARD_API(grpc_api)
 		rq.delta = c.delta; rq.expect_version = c.version;
 		memset(&rs, 0, sizeof rs);
 		rc = gb_data(globals.bridge, &rq, globals.data_timeout_ms, &rs);
-		da_reply(c.op, rc, rs.value, rs.version, rs.error, reply, sizeof reply);
+		rlen = (rs.value ? strlen(rs.value) : 0) + 128;
+		reply = malloc(rlen);
+		if (reply) da_reply(c.op, rc, rs.value, rs.version, rs.error, reply, rlen);
 		gb_data_res_free(&rs);
+		free(line);
 		switch_mutex_lock(globals.state_mutex);
 		globals.data_ops++;
-		if (strncmp(reply, "+OK", 3)) globals.data_errors++;
+		if (!reply || strncmp(reply, "+OK", 3)) globals.data_errors++;
 		switch_mutex_unlock(globals.state_mutex);
-		stream->write_function(stream, "%s\n", reply);
+		stream->write_function(stream, "%s\n", reply ? reply : "-ERR unavailable");
+		free(reply);
 		return SWITCH_STATUS_SUCCESS;
 	}
 	mycmd = strdup(cmd);
