@@ -200,6 +200,8 @@ struct gb_bridge {
   // survival.cc
   void survival_loop();
   void survival_wake(const std::string& tenant);
+  // The survival snapshot of a tenant survival tracks: cached pinned, so other traffic cannot evict it
+  bool survival_pin(const std::string& tenant, int kind, const std::string& key);
   void on_invalidate(const cp::Invalidate& v);
   // calls.cc
   void on_command(const cp::Command& c);

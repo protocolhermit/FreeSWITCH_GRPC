@@ -31,9 +31,10 @@ class Cache {
 
   explicit Cache(size_t max_entries, Now now = Clock::now) : max_(max_entries ? max_entries : 1), now_(std::move(now)) {}
 
-  // ttl_s <= 0 means "do not cache".
+  // ttl_s <= 0 means "do not cache". pin: kept out of the LRU (never evicted, not counted against max_entries), for
+  // the survival snapshots, which must outlive any amount of other traffic. The caller bounds how many it pins.
   void put(const std::string& tenant, int kind, const std::string& key, bool found, int64_t version, int32_t ttl_s,
-           std::string payload) {
+           std::string payload, bool pin = false) {
     if (ttl_s <= 0) return;
     std::lock_guard<std::mutex> l(mu_);
     // version 0 = unversioned, exempt; otherwise refuse answers older than a seen Invalidate
@@ -41,13 +42,14 @@ class Cache {
     std::string id = make_id(tenant, kind, key);
     auto it = index_.find(id);
     if (it != index_.end()) {
-      lru_.erase(it->second);
+      list_of(*it->second).erase(it->second);
       index_.erase(it);
     }
     auto t = now_();
-    lru_.push_front(Node{tenant, kind, key, id, Entry{found, version, std::move(payload), ttl_s, false},
-                         t + std::chrono::seconds(ttl_s), t});
-    index_[id] = lru_.begin();
+    auto& to = pin ? pinned_ : lru_;
+    to.push_front(Node{tenant, kind, key, id, Entry{found, version, std::move(payload), ttl_s, false},
+                       t + std::chrono::seconds(ttl_s), t, pin});
+    index_[id] = to.begin();
     while (lru_.size() > max_) {
       index_.erase(lru_.back().id);
       lru_.pop_back();
@@ -70,7 +72,7 @@ class Cache {
       ++st_.misses;
       return false;
     }
-    lru_.splice(lru_.begin(), lru_, it->second);
+    list_of(n).splice(list_of(n).begin(), list_of(n), it->second);
     *out = n.e;
     out->stale = expired;
     expired ? ++st_.stale_served : ++st_.hits;
@@ -100,17 +102,18 @@ class Cache {
       if (version > f) f = version;
     }
     size_t dropped = 0;
-    for (auto it = lru_.begin(); it != lru_.end();) {
-      bool match = it->tenant == tenant && (kind == 0 || it->kind == kind) && (key == "*" || it->key == key) &&
-                   it->e.version < version;
-      if (match) {
-        index_.erase(it->id);
-        it = lru_.erase(it);
-        ++dropped;
-      } else {
-        ++it;
+    for (auto* l : {&lru_, &pinned_})
+      for (auto it = l->begin(); it != l->end();) {
+        bool match = it->tenant == tenant && (kind == 0 || it->kind == kind) && (key == "*" || it->key == key) &&
+                     it->e.version < version;
+        if (match) {
+          index_.erase(it->id);
+          it = l->erase(it);
+          ++dropped;
+        } else {
+          ++it;
+        }
       }
-    }
     st_.invalidated += dropped;
     return dropped;
   }
@@ -120,19 +123,21 @@ class Cache {
   void expire_all() {
     std::lock_guard<std::mutex> l(mu_);
     auto t = now_();
-    for (auto& n : lru_) n.expires = t;
+    for (auto* l : {&lru_, &pinned_})
+      for (auto& n : *l) n.expires = t;
   }
 
   void clear() {
     std::lock_guard<std::mutex> l(mu_);
     lru_.clear();
+    pinned_.clear();
     index_.clear();
   }
 
   Stats stats() {
     std::lock_guard<std::mutex> l(mu_);
     Stats s = st_;
-    s.entries = lru_.size();
+    s.entries = lru_.size() + pinned_.size();
     return s;
   }
 
@@ -145,7 +150,9 @@ class Cache {
     Entry e;
     Clock::time_point expires;
     Clock::time_point stored;
+    bool pinned;
   };
+  std::list<Node>& list_of(const Node& n) { return n.pinned ? pinned_ : lru_; }
   int64_t floor_of(const std::string& tenant, int kind) const {
     int64_t f = 0;
     for (int k : {kind, 0}) {
@@ -162,6 +169,7 @@ class Cache {
   size_t max_;
   Now now_;
   std::list<Node> lru_;
+  std::list<Node> pinned_;  // survival snapshots: out of the LRU
   std::unordered_map<std::string, std::list<Node>::iterator> index_;
   std::unordered_map<std::string, int64_t> floors_;  // (tenant, kind) -> highest Invalidate version; kept by clear()
   Stats st_;

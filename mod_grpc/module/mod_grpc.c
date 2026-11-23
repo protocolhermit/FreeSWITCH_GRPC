@@ -417,7 +417,11 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 			switch_snprintf(args, sizeof(args), "%s call_timeout=%d", c->uuid, c->timeout_s);
 			run_api("uuid_setvar", args, err, errlen);
 		}
-		switch_snprintf(args, sizeof(args), "%s bridge::%s aleg", c->uuid, c->npeers ? pdial : c->dial_string);
+		/* snprintf, not switch_snprintf: its return is the needed length, so a cut-off dial string is refused, never run */
+		if (snprintf(args, sizeof(args), "%s bridge::%s aleg", c->uuid, c->npeers ? pdial : c->dial_string) >= (int) sizeof(args)) {
+			switch_snprintf(err, errlen, "bridge: dial string too long");
+			return SWITCH_FALSE;
+		}
 		return run_api("uuid_broadcast", args, err, errlen);
 	case GB_CMD_PARK:
 		return run_api("uuid_park", c->uuid, err, errlen);
@@ -426,7 +430,10 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 			switch_snprintf(err, errlen, "playback: bad file");
 			return SWITCH_FALSE;
 		}
-		switch_snprintf(args, sizeof(args), "%s playback::%s aleg", c->uuid, c->file);
+		if (snprintf(args, sizeof(args), "%s playback::%s aleg", c->uuid, c->file) >= (int) sizeof(args)) {
+			switch_snprintf(err, errlen, "playback: file name too long");
+			return SWITCH_FALSE;
+		}
 		return run_api("uuid_broadcast", args, err, errlen);
 	case GB_CMD_HANGUP:
 		switch_snprintf(args, sizeof(args), "%s %s", c->uuid, c->cause[0] ? c->cause : "NORMAL_CLEARING");

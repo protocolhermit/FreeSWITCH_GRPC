@@ -58,7 +58,7 @@ int gb_bridge::fetch(const std::string& tenant, int kind, const std::string& key
   int ttl = lr.found() ? lr.ttl_s() : std::min<int>(lr.ttl_s(), kNegativeTtlCapS);
   // An engine that does not serve XML answers not found with no TTL; without a floor every dialplan hunt would ask.
   if (!lr.found() && kind == GB_KIND_XML && ttl <= 0) ttl = kNegativeTtlCapS;
-  cache.put(tenant, kind, key, en->found, en->version, ttl, en->payload);
+  cache.put(tenant, kind, key, en->found, en->version, ttl, en->payload, survival_pin(tenant, kind, key));
   return GB_OK;
 }
 

@@ -17,6 +17,12 @@ void gb_bridge::survival_wake(const std::string& tenant) {
   scv.notify_all();
 }
 
+bool gb_bridge::survival_pin(const std::string& tenant, int kind, const std::string& key) {
+  if (survival_refresh_s <= 0 || kind != GB_KIND_CONFIG || key != GB_SURVIVAL_KEY) return false;
+  std::lock_guard<std::mutex> l(sm);
+  return stenants.count(tenant) > 0;  // bounded by kMaxTenants
+}
+
 // Fetches the dirty tenants as soon as there are any (first touch, Invalidate) and every tenant each survival_refresh_s.
 // A failed fetch keeps the old entry; a "not found" answer drops it, which ends survival for a gone tenant.
 void gb_bridge::survival_loop() {
