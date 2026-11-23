@@ -133,6 +133,12 @@ Add `<load module="mod_grpc"/>` to `modules.conf.xml`, or run `load mod_grpc` fr
 | `directory-auth` | on in `local`/`engine`, off in `edge` | Put `a1_hash` or `password` from the engine's directory answer into the user entry, so sofia can challenge. When on, every user entry also gets `allow-empty-password=false`, so a user without credentials can't authenticate. Turning it off in `local`/`engine` mode logs a load-time WARNING: sofia then has no credentials to challenge with. |
 | `peer-profile` | `internal` | Sofia profile used for peer hop legs (`[A-Za-z0-9_-]+`). |
 | `sip-address` | – | `host:port` peers dial to reach this node (host is an IPv4 address or a name, `[A-Za-z0-9.-]`). **Required** in `engine` mode, and the module refuses to load if it is not `host:port`. Sent in `Hello`. |
+| `data-timeout` | `1500` | Milliseconds a `grpc data` call waits for the engine. |
+| `media-hosts` | – | Comma-separated host names `Playback.url` and `Collect.prompt_url` may fetch from. Bare names, no port, matched exactly and case-insensitively. Empty (the default) turns remote media off. |
+| `media-cache-dir` | `<storage-dir>/grpc-media` | Where fetched media is kept. |
+| `media-cache-max` | `1073741824` | Cache size cap in bytes. Over it, the oldest files go first (the file just fetched is never removed). A value below `media-max-bytes` is raised to it, with a warning. |
+| `media-max-bytes` | `20971520` | Per-file download cap. |
+| `media-fetch-timeout` | `10` | Seconds per download. |
 | `<domain-tenants>` | – | A block next to `<settings>`: `<domain name="acme.example" tenant="<uuid>"/>`. Maps a domain to a tenant without asking the engine. Used in `local` mode only. |
 
 The module **refuses to load** in these cases:
@@ -256,20 +262,96 @@ channel that has a `tenant_id`:
 | `grpc xml` | Shows the XML-fetch sections, mode, served and rejected counts, the last rejection, and the ACL reload state. |
 | `grpc survival <tenant>` | Shows whether a survival snapshot is ready. |
 | `grpc tenant <domain>` | Shows which tenant a domain resolves to and where it came from, as `tenant=<uuid or -> source=<none, default, map, or engine>`. It uses no channel, so a header or variable never counts here. |
+| `grpc data <op> <tenant> <key> ...` | Reads or writes the engine's key/value store. See below. |
 | `grpc undrain` | Accepts new inbound calls again after an engine `Drain`. |
 
 Example:
 
 ```
 freeswitch> grpc status
-node=fs-01 endpoints=engine1:9443 connected=yes draining=no cache_entries=12 hits=340 stale_served=0 invalidated=3 survival=off last="session 7f3c..." mode=edge tenancy=multi untrusted_tenant_headers=0
+node=fs-01 endpoints=engine1:9443 connected=yes draining=no cache_entries=12 hits=340 stale_served=0 invalidated=3 survival=off last="session 7f3c..." mode=edge tenancy=multi untrusted_tenant_headers=0 features=data,mwi,media_url data_ops=0 data_errors=0 media_fetches=0 media_cache_hits=0
 ```
+
+`features` is what the engine listed in `HelloAck.features`. `data_ops` and
+`data_errors` count `grpc data` calls and the ones that did not answer `+OK`.
+`media_fetches` and `media_cache_hits` count remote media downloads and cache hits.
 
 `mode`, `tenancy`, and `untrusted_tenant_headers` are always shown. In `engine`
 mode the line also ends with `reg_streams=<n> reg_events_sent=<n> reg_events_dropped=<n> reg_resync_last=<unix time or never>`:
 the registration streams open (0: events go on the main stream),
 registration events sent, live events lost because the send queue was full,
 and when the last replay ran.
+
+### `grpc data`
+
+A tenant-scoped key/value store kept by the engine. Use it for state that
+several nodes share and change during calls, such as counters, locks and
+queue positions.
+
+```
+grpc data get  <tenant> <key>
+grpc data set  <tenant> <key> <ttl_s> <value>
+grpc data del  <tenant> <key>
+grpc data incr <tenant> <key> <delta> [<ttl_s>]
+grpc data cas  <tenant> <key> <version> <ttl_s> <value>
+```
+
+`ttl_s` 0 means no expiry. For `incr`, the TTL applies only when it creates the
+key. `cas` writes only if the key's version equals `<version>`; 0 means "only
+if absent". The value is everything after the fixed arguments, so it may
+contain spaces.
+
+| Reply | Meaning |
+|-------|---------|
+| `+OK <version> <value>` | `get` found it, or `incr` (the value is the new integer). |
+| `+OK <version>` | `set` or `cas` (the new version). |
+| `+OK` | `del`, also when the key did not exist. |
+| `-ERR not_found` | `get` found nothing. |
+| `-ERR conflict <version>` | `cas`: the current version differs (0 = absent). |
+| `-ERR unsupported` | The engine's `HelloAck.features` lacks `"data"`. |
+| `-ERR unavailable`, `timeout`, `disconnected` | The engine's store, the engine, or the connection failed. |
+| `-ERR bad_args`, `too_large`, `not_integer`, `bad_value` | Bad syntax or tenant, value over 64 KiB, `incr` on a non-integer, or a stored value that is not printable UTF-8. |
+
+- `tenant` must be UUID-shaped. With `tenancy=single` it must be
+  `default-tenant`. The module does not check who is calling: dialplan, ESL and
+  modules are operator code, as with any other API command.
+- Key: 1-256 printable ASCII bytes, no spaces. Value: UTF-8 without control
+  characters, at most 64 KiB. Store JSON or base64 for anything else.
+- **Values are never cached.** Every call goes to the engine. Data that rarely
+  changes belongs in a `CONFIG` lookup, which is cached.
+- The call blocks its thread until the engine answers or `data-timeout` passes.
+  Do not call it from the event dispatch thread.
+- An engine-served `ApiBatch` cannot run `grpc`: it is on the built-in deny
+  list.
+
+### Remote media and hold music
+
+With `media-hosts` set, `Playback` and `Collect` can play a presigned URL
+(see [protocol.md](protocol.md) §5). The node downloads it before playback, so
+the caller hears silence meanwhile.
+
+- Only `.wav`, `.mp3` and `.ogg`, from a listed host, over http or https.
+  Redirects are not followed. A non-2xx answer is the error `fetch: http <code>`
+  and is never cached.
+- The cache key is the host and object path. The scheme, port and query string
+  are ignored, so one object path must always hold the same content.
+- URLs work only in a call's own route or step answer. On the stream path they
+  are refused.
+- `local_stream://<name>` is accepted in prompts. The stream itself comes from
+  `local_stream.conf`, which `xml-sections` can serve from the engine.
+
+### Message waiting
+
+The engine's `MessageWaiting` command makes sofia NOTIFY the user's devices
+registered on this node. `domain` must belong to the command's tenant, by the
+same rules as `grpc tenant`.
+
+### Engine-side call center, voicemail and fifo
+
+A node whose engine runs call-center queues, voicemail or fifo must **not**
+load `mod_callcenter`, `mod_voicemail` or `mod_fifo`. The engine does that work
+(see [building-an-engine.md](building-an-engine.md) §11), and a second
+implementation on the node would fight it for the same calls.
 
 ---
 

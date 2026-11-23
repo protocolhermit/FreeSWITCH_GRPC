@@ -61,7 +61,7 @@ timeouts are:
 ```proto
 message Hello    { string node_id; string version; string token; repeated string tags; int32 capacity; string boot_id;
                     string sip_address; string registration_mode; }
-message HelloAck { bool accepted; string reason; string session_id; int32 heartbeat_interval_s; }
+message HelloAck { bool accepted; string reason; string session_id; int32 heartbeat_interval_s; repeated string features; }
 message Heartbeat{ int32 active_calls; int32 cpu_pct; int64 ts_unix_ms; }
 ```
 
@@ -81,6 +81,13 @@ message Heartbeat{ int32 active_calls; int32 cpu_pct; int64 ts_unix_ms; }
   profile (the `sip-address` setting). Empty when unset.
 - `registration_mode` (8) is `"local"` or `"engine"`. It is **empty in `edge`
   mode**, so an edge node's `Hello` is unchanged.
+- `features` (5) lists the optional capabilities the engine serves: `"data"`
+  (it answers `DataRequest`), `"media_url"` (it sends `Playback.url` and
+  `Collect.prompt_url`) and `"mwi"` (it sends `MessageWaiting`). Absent means
+  none. Only `"data"` changes node behaviour: without it, `grpc data` answers
+  `-ERR unsupported` at once instead of waiting out `data-timeout` for a reply
+  an older engine never sends. The node shows the list as `features=` in
+  `grpc status`.
 - `heartbeat_interval_s` sets how often the node sends `Heartbeat`. `0` means
   every 5 s.
 
@@ -152,6 +159,34 @@ Caching rules:
   - Send it whenever the data behind a key changes.
   - `Invalidate{tenant_id:"", kind:XML, key:"configuration/acl.conf"}` also
     makes the node reload its ACLs.
+
+### Data requests
+
+```proto
+message DataRequest  { string tenant_id; Op op; string key; string value; int32 ttl_s; int64 delta; int64 expect_version;
+                       enum Op { UNSPECIFIED = 0; GET = 1; SET = 2; DEL = 3; INCR = 4; CAS = 5; } }
+message DataResponse { bool ok; bool found; bool conflict; bool unavailable; string value; int64 version; string error; }
+```
+
+`NodeMessage.data_request` (11) and `EngineMessage.data_response` (8). The node
+sends a `DataRequest` for each `grpc data` command (see
+[user-guide.md](user-guide.md) §4). Correlate by `request_id`, as with a
+lookup. The node never caches a `DataResponse`.
+
+| Op | Uses | Answer |
+|----|------|--------|
+| `GET` | `key` | `ok`, and `found` with `value` and `version`. A missing key is `ok=true, found=false`. |
+| `SET` | `key`, `value`, `ttl_s` | `ok` with the new `version`. `ttl_s=0` means no expiry. |
+| `DEL` | `key` | `ok`, also when the key did not exist. |
+| `INCR` | `key`, `delta`, `ttl_s` | `ok` with `value` = the new integer and its `version`. A missing key counts as 0, and `ttl_s` applies only when `INCR` creates it. A value that is not an integer gives `ok=false, error="not_integer"`. |
+| `CAS` | `key`, `value`, `ttl_s`, `expect_version` | Writes only when the key's version equals `expect_version` (0 = only if absent). On success `ok` with the new `version`. On a mismatch `conflict=true` and `version` = the current one (0 = absent). |
+
+- `tenant_id` is always set, and the engine keeps keys under that tenant only.
+- `unavailable=true` means the engine could not reach its store.
+- `version` is a per-key counter. Every write bumps it, so a `CAS` is safe
+  across nodes.
+- `key` is 1-256 printable ASCII bytes without spaces. `value` is UTF-8 with
+  no control characters, at most 64 KiB. The node checks both before sending.
 
 ---
 
@@ -256,10 +291,10 @@ There are two ways a command arrives:
 | `Bridge` | `uuid`, `dial_string`, `timeout_s`, `peer_tenant_id`, `peer_caller_id`, `peer_addresses`, `peer_target` | Bridges the call to a dial string. See "Peer legs" below. |
 | `BridgeLegs` | `uuid_a`, `uuid_b` | Bridges two existing legs |
 | `Park` | `uuid` | Parks the call |
-| `Playback` | `uuid`, `file` | Plays a file or stream |
+| `Playback` | `uuid`, `file`, `url` | Plays a file or stream. `url` replaces `file`: see "Remote media" below. |
 | `Hangup` | `uuid`, `cause` | Hangs up with that cause |
 | `Transfer` | `uuid`, `token` | `token` must be UUID-shaped. The node sets `xfer_token` and transfers the call to extension `xfer` in context `default`. The `default` dialplan must send it to `grpc_route`. The call then comes back as a new `RouteRequest` with `vars.xfer_token` |
-| `Collect` | `uuid`, `prompt`, `min_digits`, `max_digits` (1..32), `timeout_ms` (1..60000), `terminators` (subset of `0-9#*`) | Plays a prompt and reads digits |
+| `Collect` | `uuid`, `prompt`, `prompt_url`, `min_digits`, `max_digits` (1..32), `timeout_ms` (1..60000), `terminators` (subset of `0-9#*`) | Plays a prompt (or `prompt_url`) and reads digits |
 | `Record` | `uuid`, `name`, `max_len_s`, `silence_s`, `beep`, `upload_url` | Records to `<record-dir>/<tenant>/<name>.wav`, then optionally PUTs the file to a presigned URL |
 | `Conference` | `uuid`, `room`, `profile`, `mute`, `moderator`, `wait_for_moderator` | Joins room `<tenant>_<room>` |
 | `ConferenceControl` | `room`, `action`, `member_uuid`, `upload_url`, `rec_id`, `max_s`, `recording_prompt` | Stream only. Actions: mute, unmute, mute_all, unmute_all, kick, lock, unlock, end, record_start, record_stop |
@@ -268,7 +303,42 @@ There are two ways a command arrives:
 | `Eavesdrop` | `uuid`, `target_uuid`, `mode` | Supervisor listens to, whispers to, or barges into a target call |
 | `SuperviseMode` | `uuid`, `mode` | Switches the eavesdrop mode |
 | `Announce` | `uuid`, `prompt`, `leg_only` | Plays a prompt to one or both legs |
+| `MessageWaiting` | `user`, `domain`, `new_msgs`, `saved_msgs`, `new_urgent`, `saved_urgent` | Stream only. Lights or clears the message-waiting lamp: see below. |
 | `Drain` | `deadline_s` | Stops accepting new inbound calls |
+
+### Remote media
+
+`Playback.url` (3) and `Collect.prompt_url` (7) are presigned `http(s)` GET
+URLs of a `.wav`, `.mp3` or `.ogg`. They exist so a voicemail recorded on one
+node (`Record` with `upload_url`) can play on another.
+
+- A URL replaces `file` or `prompt`. Setting both is an error:
+  `playback: url and file`, `collect: url and file`.
+- The node fetches only from hosts in `media-hosts` (empty = off), without
+  following redirects, and caches the file locally (user-guide §2). A failed
+  fetch is the command's `error`: `fetch: no media-hosts`, `fetch: not allowed`,
+  `fetch: http <code>`, `fetch: too large`, `fetch: timeout`. A non-2xx answer
+  is never cached.
+- **Inline only.** The download blocks the call's thread and the caller hears
+  silence meanwhile, so the stream path refuses a URL (`playback: url is inline
+  only`, and the same for `Announce`).
+- The cache key is the host and object path, **not** the query string or
+  scheme. The engine must never reuse an object path for different content.
+- `Playback.file` and the other prompts also accept `local_stream://<name>`,
+  where `<name>` is one safe component. It plays a hold-music stream from the
+  node's `local_stream.conf`.
+
+### `MessageWaiting`
+
+Stream only, because it names no call. The node fires a message-waiting event
+for `user@domain`, and sofia sends a NOTIFY to that user's devices registered
+**on this node**. Send it to every node that holds a registration for the user.
+A node with none does nothing.
+
+- `domain` must resolve to the command's `tenant_id`, or the result is
+  `mwi: domain not in tenant`. `user` and `domain` must be safe names, or
+  `mwi: bad user or domain`. A negative count gives `mwi: bad counts`.
+- Messages waiting is `yes` when `new_msgs` or `new_urgent` is above 0.
 
 ### Peer legs (`engine` mode)
 

@@ -564,3 +564,227 @@ The snippet needs `rdb *redis.Client` on `engine`, `sipAddress string` on
 when `h.BootId` differs from the one last stored for that node. The `node:<id>`
 set can hold stale members after an `HEXPIRE` expiry. `HDel` on a missing field
 does nothing, so that is harmless.
+
+---
+
+## 9. Data model
+
+Everything the node asks for must cost the same on the thousandth tenant as on
+the first. Use one Redis key per lookup, and never scan. `{t}` below is the
+tenant id. The layouts are suggestions, not part of the protocol, except that
+the engine must answer each lookup kind with the payload the node expects
+(protocol.md §3). In Redis Cluster the braces are a hash tag, which keeps one
+tenant's keys on one slot.
+
+| Data | Key | Type | Read | Write |
+|------|-----|------|------|-------|
+| Directory | `dir:{t}:{user}@{domain}` | hash: `name`, `a1_hash`, `vars` (JSON) | `HGETALL`, O(1) | `HSET` / `DEL`, O(1) |
+| Domain to tenant | `domain:{fqdn}` (lowercase) | string: the tenant id | `GET`, O(1) | `SET` / `DEL`, O(1) |
+| Dialplan or config document | `doc:{t}:{kind}:{key}` | string: the XML or JSON | `GET`, O(1) | `SET` / `DEL`, O(1) |
+| Registrations | `reg:{t}:{user}@{domain}` | hash per user, a field per device (§8) | `HGETALL`, O(devices) | `HSET` + `HEXPIRE` / `HDEL`, O(1) |
+| Version | `ver:{t}:{kind}:{key}` | integer | `GET`, O(1) | `INCR`, O(1) |
+
+`domain:{fqdn}` has no tenant in its key because the node asks for it with an
+empty `tenant_id`. A directory user that is not found, or a domain nobody
+owns, answers `found=false`: a `GET` on a missing key is still O(1).
+
+**On every write**, in this order:
+
+1. `INCR ver:...` for the key you changed.
+2. Write the data.
+3. Send `Invalidate` for that tenant, kind and key, with `Version` set to the
+   `INCR` result, to every connected node (section 5).
+
+The version is what lets the node refuse an older answer that was already in
+flight (protocol.md §3). Put the same number in `LookupResponse.version`.
+
+---
+
+## 10. The `grpc data` store
+
+`grpc data` (user-guide.md §4) arrives as a `DataRequest`. List `"data"` in
+`HelloAck.Features`, or the node answers `-ERR unsupported` without asking:
+
+```go
+_ = st.Send(&pb.EngineMessage{Body: &pb.EngineMessage_HelloAck{HelloAck: &pb.HelloAck{
+	Accepted: true, SessionId: sid, Features: []string{"data", "media_url", "mwi"}}}})
+```
+
+Store each key as one hash, `data:{t}:{key}`, with two fields: `v`, the value,
+and `ver`, a counter bumped on every write. `GET` is one `HGETALL` and `DEL`
+is one `DEL`. The other three are one Lua script each, so they are atomic and
+cost one round trip. `ttl_s` becomes `PEXPIRE` on the hash (`PERSIST` for 0).
+All are O(1).
+
+```lua
+-- SET: KEYS[1]=hash, ARGV[1]=value, ARGV[2]=ttl in ms (0 = none). Returns the new version.
+local ver = redis.call('HINCRBY', KEYS[1], 'ver', 1)
+redis.call('HSET', KEYS[1], 'v', ARGV[1])
+if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) else redis.call('PERSIST', KEYS[1]) end
+return ver
+```
+
+```lua
+-- INCR: KEYS[1]=hash, ARGV[1]=delta, ARGV[2]=ttl in ms. Returns {'ok', value, ver} or {'not_integer'}.
+local r = redis.pcall('HINCRBY', KEYS[1], 'v', ARGV[1])
+if type(r) == 'table' then return {'not_integer'} end   -- v holds text, or overflow; nothing was written
+local ver = redis.call('HINCRBY', KEYS[1], 'ver', 1)
+if ver == 1 and tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end  -- the TTL applies on creation
+return {'ok', redis.call('HGET', KEYS[1], 'v'), ver}
+```
+
+```lua
+-- CAS: KEYS[1]=hash, ARGV[1]=expected version (0 = absent), ARGV[2]=value, ARGV[3]=ttl in ms.
+-- Returns {1, new version} or {0, current version}.
+local cur = tonumber(redis.call('HGET', KEYS[1], 'ver') or '0')
+if cur ~= tonumber(ARGV[1]) then return {0, cur} end
+local ver = redis.call('HINCRBY', KEYS[1], 'ver', 1)
+redis.call('HSET', KEYS[1], 'v', ARGV[2])
+if tonumber(ARGV[3]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[3]) else redis.call('PERSIST', KEYS[1]) end
+return {1, ver}
+```
+
+A key that expires or is deleted starts again at version 1, so an old version
+can match a new key's version. Treat a version as good for one read-modify-write,
+not as a long-lived token.
+
+The handler, using the same `rdb *redis.Client` as section 8. It replies in
+its own goroutine, like every other request:
+
+```go
+var setS, incrS, casS = redis.NewScript(setLua), redis.NewScript(incrLua), redis.NewScript(casLua)
+
+func (e *engine) data(ctx context.Context, n *node, rid string, q *pb.DataRequest) {
+	key := "data:" + q.TenantId + ":" + q.Key
+	ttl := int64(q.TtlS) * 1000
+	r := &pb.DataResponse{Ok: true}
+	var err error
+	switch q.Op {
+	case pb.DataRequest_GET:
+		var m map[string]string
+		if m, err = e.rdb.HGetAll(ctx, key).Result(); err == nil {
+			r.Found = len(m) > 0
+			r.Value, r.Version = m["v"], atoi64(m["ver"])
+		}
+	case pb.DataRequest_SET:
+		var v int64
+		if v, err = setS.Run(ctx, e.rdb, []string{key}, q.Value, ttl).Int64(); err == nil {
+			r.Version = v
+		}
+	case pb.DataRequest_DEL:
+		err = e.rdb.Del(ctx, key).Err()
+	case pb.DataRequest_INCR:
+		var a []any
+		if a, err = incrS.Run(ctx, e.rdb, []string{key}, q.Delta, ttl).Slice(); err == nil {
+			if a[0] == "ok" {
+				r.Value, r.Version = a[1].(string), a[2].(int64)
+			} else {
+				r.Ok, r.Error = false, "not_integer"
+			}
+		}
+	case pb.DataRequest_CAS:
+		var a []any
+		if a, err = casS.Run(ctx, e.rdb, []string{key}, q.ExpectVersion, q.Value, ttl).Slice(); err == nil {
+			r.Version, r.Conflict = a[1].(int64), a[0].(int64) == 0
+		}
+	default:
+		r.Ok, r.Error = false, "bad_op"
+	}
+	if err != nil {
+		r = &pb.DataResponse{Unavailable: true}
+	}
+	n.send(&pb.EngineMessage{RequestId: rid, Body: &pb.EngineMessage_DataResponse{DataResponse: r}})
+}
+
+// From Connect: case *pb.NodeMessage_DataRequest: go e.data(ctx, n, m.RequestId, b.DataRequest)
+```
+
+`atoi64` is `strconv.ParseInt` with the error dropped. As elsewhere in this
+guide it is illustrative and was not run against a live Redis. Setting
+`Conflict` leaves `Ok` true, and the node reads `conflict` first. The node
+checks the key and value limits before it sends, so the engine can rely on
+them.
+
+---
+
+## 11. Shared features: call-center queues, fifo and voicemail
+
+These run in the engine, on the data model above. The node needs no extra
+modules (do not load `mod_callcenter`, `mod_voicemail` or `mod_fifo`). Every
+step on a call's path below is O(1) or O(log n) in the size of one queue or
+mailbox, never in the number of tenants, agents or messages.
+
+### Call-center queue
+
+| Key | Type | Holds |
+|-----|------|-------|
+| `cc:{t}:q:{queue}` | sorted set | Waiting callers, scored by join time and priority |
+| `cc:{t}:agent:{id}` | hash | `status`, `state`, `node`, `uuid` |
+| `cc:{t}:avail:{queue}` | sorted set | Available agents, scored by last call end: the lowest score is the longest idle |
+
+Flow:
+
+1. The caller arrives. `ZADD` it to the queue, O(log n), and `Park` it. Start
+   hold music with a stream `Playback` of `local_stream://<name>`, on the
+   parked caller.
+2. To pick an agent, `ZPOPMIN` the availability set, O(log n). Read the agent's
+   hash, O(1), for its `node` and `uuid`.
+3. Send a `Bridge` with peer legs to the agent's node (section 8). To announce
+   something first (position, "your call is recorded"), interrupt the music
+   with a `Playback` or `Announce` and start the stream again afterwards. Both
+   use local files or `local_stream://`: URLs are inline only.
+4. On no answer, `ZADD` the agent back to the availability set with a worse
+   score (a penalty), O(log n), and pop the next one.
+5. On answer, `ZREM` the caller from the queue, O(log n), and `HSET` the
+   agent's `state`, O(1).
+
+Agent state changes come from `CallEvent`s: on hangup, `HSET state` and `ZADD`
+the agent to the availability set with the end time as the score. A caller's
+position is `ZRANK`, O(log n).
+
+### Fifo
+
+The same shape as the queue, with a list per fifo and consumers in place of
+agents:
+
+| Key | Type | Holds |
+|-----|------|-------|
+| `fifo:{t}:{name}` | list | Waiting callers, `RPUSH` to join, `LPOP` to take, O(1) |
+| `fifo:{t}:{name}:consumers` | sorted set | Ready consumers, scored by last call end, `ZPOPMIN`, O(log n) |
+
+### Voicemail
+
+| Key | Type | Holds |
+|-----|------|-------|
+| `vm:{t}:box:{user}` | hash | PIN hash, greeting object, preferences |
+| `vm:{t}:msgs:{user}:new` and `vm:{t}:msgs:{user}:saved` | sorted sets | Message ids, scored by time |
+| `vm:{t}:msg:{id}` | hash | Caller id, length, object |
+
+Leaving a message:
+
+1. `Playback` with `url` set to a presigned GET of the greeting object,
+   after `HGETALL` of the box, O(1).
+2. `Record` with an `upload_url` for a **fresh object**. Name it with a new
+   id, for example `vm/{t}/{user}/<uuid>.wav`.
+3. On the `StepResult`, `HSET` the message hash and `ZADD` its id to the `new`
+   set, O(log n).
+4. Send `MessageWaiting` with counts from `ZCARD` of the two sets, O(1).
+
+**Never reuse an object path for different content.** The node caches media by
+host and path and ignores the query string, so a greeting re-recorded under the
+same path would keep playing the old file. Give each greeting and message a new
+path, and delete the old object.
+
+MWI goes to every node holding a registration for the user: read
+`reg:{t}:{user}@{domain}` (section 8), take the distinct `node_id`s, and send
+one `MessageWaiting` command to each. A node without a device ignores it. Do
+this after every change to the counts: a new message, a save, a delete.
+
+Listening:
+
+1. `Collect` the PIN, then compare with the stored hash.
+2. Run the menu as a multi-step call: `Collect` for the choice, then `Playback`
+   with a presigned `url` for the message, and `ZRANGE` of the `new` set with a
+   small `LIMIT`, O(log n + page), for the next one.
+3. Saving moves the id from `new` to `saved` (`ZREM` + `ZADD`), and deleting is
+   `ZREM` + `DEL` of the message hash, all O(log n). Then update the lamp.
