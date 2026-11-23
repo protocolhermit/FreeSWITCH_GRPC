@@ -83,7 +83,7 @@ typedef struct {
 } gb_data_res_t;
 /* One uncached round trip to the engine's data API. GB_OK (out->version, out->value for GET/INCR); GB_ERR_NOT_FOUND (get);
  * GB_ERR_CONFLICT (out->version = current); GB_ERR_UNAVAILABLE; GB_ERR_ENGINE (out->error); GB_ERR_TIMEOUT;
- * GB_ERR_DISCONNECTED; GB_ERR_ARG (NULL or bad op). Never touches the cache. */
+ * GB_ERR_DISCONNECTED; GB_ERR_ARG (NULL, bad op, or tenant/key/value not UTF-8). Never touches the cache. */
 int gb_data(gb_bridge_t *b, const gb_data_req_t *r, int timeout_ms, gb_data_res_t *out);
 void gb_data_res_free(gb_data_res_t *r);
 /* 1 when the live session's HelloAck listed the feature */
@@ -202,7 +202,8 @@ typedef struct {
 } gb_lookup_result_t;
 
 /* Cache first; on a miss asks the engine. When the engine cannot be reached
- * a stale entry is served rather than an error (fail-static). */
+ * a stale entry is served rather than an error (fail-static). A tenant or key that is not UTF-8 is never sent
+ * (GB_ERR_ARG, unless a cached entry answers); gb_fetch refuses it the same way. */
 int gb_lookup(gb_bridge_t *b, const char *tenant, int kind, const char *key, int timeout_ms, gb_lookup_result_t *out);
 void gb_lookup_result_free(gb_lookup_result_t *r);
 

@@ -303,7 +303,9 @@ static switch_bool_t exec_originate(const cmd_item_t *c, char *err, size_t errle
 	char args[4096];
 	size_t i, n = 0;
 	const int routed = c->route_on_answer;
-	if (!zstr(c->peer_tenant_id) || !zstr(c->peer_caller_id) || !c->tenant_id[0] || !safe_value(c->tenant_id) || !safe_dial(c->dial_string, NULL) ||
+	/* the tenant goes unquoted into {tenant_id=...}: a ',' would start a variable of the engine's choosing */
+	if (!zstr(c->peer_tenant_id) || !zstr(c->peer_caller_id) || !c->tenant_id[0] || !safe_value(c->tenant_id) || strchr(c->tenant_id, ',') ||
+		!safe_dial(c->dial_string, NULL) ||
 		(routed && (!dg_uuid_shaped(c->tenant_id) || !dg_single_leg(c->dial_string)))) {
 		switch_snprintf(err, errlen, "originate: bad tenant or dial string");
 		return SWITCH_FALSE;
@@ -313,7 +315,7 @@ static switch_bool_t exec_originate(const cmd_item_t *c, char *err, size_t errle
 	if (routed && !sappend(args, sizeof(args), &n, ",domain_name=dialer.invalid")) goto too_long;
 	if (c->timeout_s > 0 && !sappend(args, sizeof(args), &n, ",originate_timeout=%d", c->timeout_s)) goto too_long;
 	for (i = 0; i < c->nvars; i++) {
-		if (!safe_value(c->keys[i]) || !safe_value(c->values[i]) || strpbrk(c->keys[i], ",= \t")) {
+		if (!dg_originate_var_ok(c->keys[i]) || !safe_value(c->values[i])) { /* no api_on_answer, execute_on_*, ... */
 			switch_snprintf(err, errlen, "originate: bad variable %s", c->keys[i]);
 			return SWITCH_FALSE;
 		}

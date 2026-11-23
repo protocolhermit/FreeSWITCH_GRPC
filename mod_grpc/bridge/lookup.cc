@@ -41,6 +41,8 @@ void gb_bridge::on_invalidate(const cp::Invalidate& v) {
 
 int gb_bridge::fetch(const std::string& tenant, int kind, const std::string& key, int timeout_ms, gb::Cache::Entry* en,
                      bool* unavailable, const gb_kv_t* params, size_t nparams) {
+  // proto3 string fields: one non-UTF-8 byte (a Latin-1 SIP user is enough) makes the engine drop the whole stream
+  if (!gb_utf8_ok(tenant.c_str()) || !gb_utf8_ok(key.c_str())) return GB_ERR_ARG;
   cp::NodeMessage m;
   cp::LookupRequest* r = m.mutable_lookup();
   r->set_tenant_id(tenant);
@@ -158,7 +160,9 @@ int gb_fetch(gb_bridge_t* b, const char* tenant, int kind, const char* key, cons
 
 int gb_data(gb_bridge_t* b, const gb_data_req_t* r, int timeout_ms, gb_data_res_t* out) {
   try {
-    if (!b || !r || !out || !r->tenant_id || !r->key || r->op < GB_DATA_GET || r->op > GB_DATA_CAS) return GB_ERR_ARG;
+    if (!b || !r || !out || !gb::text_ok(r->tenant_id) || !gb::text_ok(r->key) || (r->value && !gb::text_ok(r->value)) ||
+        r->op < GB_DATA_GET || r->op > GB_DATA_CAS)
+      return GB_ERR_ARG;
     std::memset(out, 0, sizeof *out);
     cp::NodeMessage m;
     cp::DataRequest* d = m.mutable_data_request();
