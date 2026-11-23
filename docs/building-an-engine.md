@@ -11,6 +11,10 @@ Every FreeSWITCH node running `mod_grpc` connects to it and asks it how to:
 You can write it in any gRPC language. This guide uses Go, which is what the
 proto's `go_package` option targets.
 
+New to this? Start with [getting-started.md](getting-started.md). For a ready-made
+snippet per situation (IVR, voicemail, queue, conference, dialer, ...) see
+[engine-examples.md](engine-examples.md).
+
 Read [protocol.md](protocol.md) first. This guide shows how the pieces fit
 together in code.
 

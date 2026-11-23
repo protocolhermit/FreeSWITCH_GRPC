@@ -24,9 +24,10 @@ string. An empty `tenant_id` means a node-level request, for example a domain
 
 ```proto
 message NodeMessage   { string request_id = 1; oneof body { Hello, Heartbeat, LookupRequest, RouteRequest,
-                                                            CallEvent, CommandResult, StepResult, ConfEvent, RegEvent } }
+                                                            CallEvent, CommandResult, StepResult, ConfEvent, RegEvent,
+                                                            DataRequest } }
 message EngineMessage { string request_id = 1; oneof body { HelloAck, LookupResponse, Invalidate,
-                                                            RouteResponse, Command, TokenRotate } }
+                                                            RouteResponse, Command, TokenRotate, DataResponse } }
 ```
 
 `request_id` ties a reply to its request. The engine **must echo the

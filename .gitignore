@@ -4,3 +4,6 @@ build*/
 
 # test sources are kept local, not pushed
 mod_grpc/tests/
+
+# internal specs and plans, kept local
+docs/superpowers/

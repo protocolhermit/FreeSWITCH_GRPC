@@ -21,9 +21,11 @@ on the FreeSWITCH nodes.
 
 ## Docs
 
+- [Getting started](docs/getting-started.md): new here? What mod_grpc is, how a call flows, first call in ten minutes
 - [User guide](docs/user-guide.md): build, install, configure, dialplan, console commands
 - [Protocol reference](docs/protocol.md): every message in `control.proto` and how it is used
 - [Building an engine](docs/building-an-engine.md): write the server side, with a working Go example
+- [Engine cookbook](docs/engine-examples.md): a Go engine snippet for every case: auth, routing, IVR, voicemail, queue, conference, outbound, supervision, MWI, operations
 
 ## Quick build
 

@@ -17,6 +17,7 @@ SIP edge (e.g. Kamailio) ──SIP──▶ FreeSWITCH + mod_grpc ══gRPC str
 - A SIP edge is optional. Without Kamailio, the node can take phone
   registrations itself. See §9.
 
+New to FreeSWITCH or gRPC? Read [getting-started.md](getting-started.md) first.
 See [protocol.md](protocol.md) for the wire contract and
 [building-an-engine.md](building-an-engine.md) to write the server side.
 
