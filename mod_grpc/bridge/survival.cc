@@ -51,8 +51,8 @@ void gb_bridge::survival_loop() {
       bool ok = !sstop && connected && fetch(t, GB_KIND_CONFIG, GB_SURVIVAL_KEY, kFetchTimeoutMs, &en, &unavailable) == GB_OK &&
                 !unavailable;
       if (!ok) retry.insert(t);
-      // the engine's not-found has ttl 0, so put() would keep the old entry: drop it here (an exact key sets no version floor)
-      else if (!en.found) cache.invalidate(t, GB_KIND_CONFIG, GB_SURVIVAL_KEY, INT64_MAX);
+      // a tenant that is gone: drop its snapshot (erase sets no floor, so a tenant that comes back is cached again)
+      else if (!en.found) cache.erase(t, GB_KIND_CONFIG, GB_SURVIVAL_KEY);
     }
     l.lock();
   }

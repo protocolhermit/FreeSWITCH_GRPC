@@ -8,6 +8,9 @@
 namespace {
 
 const int kNegativeTtlCapS = 30;
+// A not-found sent with no TTL is still cached this long (XML: kNegativeTtlCapS), so a scanner or brute force retrying
+// one unknown user or domain costs one engine round trip per window, while a just-created user waits at most this long.
+const int kNegativeFloorS = 5;
 
 char* dup_bytes(const std::string& s) {
   char* p = static_cast<char*>(std::malloc(s.size() + 1));
@@ -57,7 +60,7 @@ int gb_bridge::fetch(const std::string& tenant, int kind, const std::string& key
   if (params) return GB_OK;  // the answer belongs to one call
   int ttl = lr.found() ? lr.ttl_s() : std::min<int>(lr.ttl_s(), kNegativeTtlCapS);
   // An engine that does not serve XML answers not found with no TTL; without a floor every dialplan hunt would ask.
-  if (!lr.found() && kind == GB_KIND_XML && ttl <= 0) ttl = kNegativeTtlCapS;
+  if (!lr.found() && ttl <= 0) ttl = kind == GB_KIND_XML ? kNegativeTtlCapS : kNegativeFloorS;
   cache.put(tenant, kind, key, en->found, en->version, ttl, en->payload, survival_pin(tenant, kind, key));
   return GB_OK;
 }

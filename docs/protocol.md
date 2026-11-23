@@ -134,13 +134,21 @@ Survival snapshot:
 
 Caching rules:
 
-- `ttl_s` is how long the node may cache the answer.
+- `ttl_s` is how long the node may cache the answer. A not-found answer is
+  cached for at most 30 s, whatever `ttl_s` says. A not-found with `ttl_s=0`
+  is still cached briefly: 30 s for `XML`, 5 s for every other kind. That way
+  a scanner retrying an unknown user or domain costs one round trip per window.
+  Send an `Invalidate` when you create a user, if 5 s is too long to wait.
 - A request with `params` is never cached. This covers the per-call XML
   dialplan.
 - `unavailable=true` means "I can't answer right now" (backend failure). It is
   **not** "not found". The node won't cache it and may serve a stale entry.
 - `Invalidate` drops cache entries that match `tenant_id`, `kind`, and `key`.
   `kind=0` matches every kind. `key="*"` matches every key.
+  - Set `version` to the new data's version. For 60 s after an exact-key
+    `Invalidate` (a wildcard one: for good), the node refuses to cache an
+    older answer for that key, so a lookup already in flight can't bring the
+    stale value back. Answers with `version=0` are exempt.
   - Send it whenever the data behind a key changes.
   - `Invalidate{tenant_id:"", kind:XML, key:"configuration/acl.conf"}` also
     makes the node reload its ACLs.
@@ -195,6 +203,11 @@ message StepResult { string tenant_id; string call_id; string uuid; string step_
                                      ConferenceOutcome; SleepOutcome; EavesdropOutcome; AmdOutcome; }
                      string error; bool hung_up; map<string,string> vars; }
 ```
+
+Any command can carry the `step_id`. The eight in the `oneof` report their
+outcome. Any other command (`Park`, `Hangup`, `Transfer`, …) gets a
+`StepResult` with no outcome set: it says only that the command ended (or
+`error`, if it failed).
 
 You reply with a `RouteResponse` carrying the next batch, using the **same
 `request_id`**. This repeats until you send a batch without a `step_id`, or

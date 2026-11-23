@@ -125,6 +125,8 @@ typedef struct {
 
 static char *dupz(const char *s) { return strdup(s ? s : ""); }
 
+static void cmd_free(cmd_item_t *o);
+
 static cmd_item_t *cmd_dup(const gb_command_t *c)
 {
 	size_t i;
@@ -165,6 +167,17 @@ static cmd_item_t *cmd_dup(const gb_command_t *c)
 				o->keys[i] = dupz(c->vars[i].key);
 				o->values[i] = dupz(c->vars[i].value);
 			}
+		}
+	}
+	{ /* out of memory anywhere above: refuse the whole command rather than run one with a missing field */
+		int bad = !o->command_id || !o->tenant_id || !o->uuid || !o->dial_string || !o->peer_tenant_id || !o->peer_caller_id ||
+				  !o->target_uuid || !o->token || !o->room || !o->rec_id || !o->upload_url || !o->file || !o->cause ||
+				  !o->peer_target || (o->npeers && !o->peers) || o->nvars != c->nvars;
+		for (i = 0; !bad && i < o->npeers; i++) bad = !o->peers[i];
+		for (i = 0; !bad && i < o->nvars; i++) bad = !o->keys[i] || !o->values[i];
+		if (bad) {
+			cmd_free(o);
+			return NULL;
 		}
 	}
 	return o;
@@ -534,7 +547,7 @@ static void cb_command(void *ud, const gb_command_t *c)
 {
 	cmd_item_t *item = cmd_dup(c);
 	if (!item || switch_queue_trypush(globals.cmdq, item) != SWITCH_STATUS_SUCCESS) {
-		gb_send_command_result(globals.bridge, c->command_id, 0, "node command queue full");
+		gb_send_command_result(globals.bridge, c->command_id, 0, item ? "node command queue full" : "out of memory");
 		cmd_free(item);
 	}
 }
@@ -1592,6 +1605,7 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 		ok = SWITCH_FALSE;
 	} else if (c->uuid && *c->uuid && strcmp(c->uuid, mine)) { /* names another call: same path as stream commands */
 		cmd_item_t *item = cmd_dup(c);
+		if (!item) switch_snprintf(err, sizeof(err), "out of memory");
 		ok = item ? exec_command(item, err, sizeof(err)) : SWITCH_FALSE;
 		cmd_free(item);
 	} else switch (c->type) {
@@ -1686,6 +1700,7 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 	}
 	default: {
 		cmd_item_t *item = cmd_dup(c);
+		if (!item) switch_snprintf(err, sizeof(err), "out of memory");
 		ok = item ? exec_command(item, err, sizeof(err)) : SWITCH_FALSE;
 		cmd_free(item);
 	}
@@ -2630,7 +2645,7 @@ static void *SWITCH_THREAD_FUNC reg_resync_thread(switch_thread_t *thread, void 
 	return NULL;
 }
 
-SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
+static switch_status_t load_impl(switch_loadable_module_interface_t **module_interface, switch_memory_pool_t *pool)
 {
 	switch_xml_t cfg, xml, settings, param;
 	switch_api_interface_t *api_interface;
@@ -2899,6 +2914,17 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
 	}
 	gb_start(globals.bridge);
 	return SWITCH_STATUS_SUCCESS;
+}
+
+/* load_impl stops what it started on each failure path; what it cannot (shared with nothing yet) is released here */
+SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_load)
+{
+	switch_status_t st = load_impl(module_interface, pool);
+	if (st != SWITCH_STATUS_SUCCESS) {
+		if (globals.domain_tenants) switch_core_hash_destroy(&globals.domain_tenants); /* no binding reads it yet */
+		curl_global_cleanup(); /* load_impl's curl_global_init, which always ran */
+	}
+	return st;
 }
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_grpc_shutdown)

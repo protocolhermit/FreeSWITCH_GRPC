@@ -306,7 +306,7 @@ int gb_step(gb_bridge_t* b, const gb_step_result_t* s, int timeout_ms, gb_route_
         break;
       }
       default:
-        return GB_ERR_ARG;
+        break;  // Park, Hangup, Transfer, ...: no outcome message, the StepResult says only that the command ended
     }
     cp::EngineMessage reply;
     int rc = b->call(&m, timeout_ms > 0 ? timeout_ms : 3000, &reply);

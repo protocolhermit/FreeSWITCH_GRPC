@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <list>
 #include <mutex>
@@ -37,9 +38,9 @@ class Cache {
            std::string payload, bool pin = false) {
     if (ttl_s <= 0) return;
     std::lock_guard<std::mutex> l(mu_);
-    // version 0 = unversioned, exempt; otherwise refuse answers older than a seen Invalidate
-    if (version != 0 && version < floor_of(tenant, kind)) return;
     std::string id = make_id(tenant, kind, key);
+    // version 0 = unversioned, exempt; otherwise refuse answers older than a seen Invalidate (wildcard or this key)
+    if (version != 0 && (version < floor_of(tenant, kind) || version < key_floor_of(id))) return;
     auto it = index_.find(id);
     if (it != index_.end()) {
       list_of(*it->second).erase(it->second);
@@ -100,6 +101,8 @@ class Cache {
     if (key == "*") {
       int64_t& f = floors_[make_id(tenant, kind, "")];
       if (version > f) f = version;
+    } else if (kind != 0) {
+      set_key_floor(make_id(tenant, kind, key), version);
     }
     size_t dropped = 0;
     for (auto* l : {&lru_, &pinned_})
@@ -116,6 +119,15 @@ class Cache {
       }
     st_.invalidated += dropped;
     return dropped;
+  }
+
+  // Drops one entry, setting no floor: a later answer for the key, of any version, is cached normally.
+  void erase(const std::string& tenant, int kind, const std::string& key) {
+    std::lock_guard<std::mutex> l(mu_);
+    auto it = index_.find(make_id(tenant, kind, key));
+    if (it == index_.end()) return;
+    list_of(*it->second).erase(it->second);
+    index_.erase(it);
   }
 
   // Marks every entry expired without deleting it: fail-static can still serve
@@ -153,6 +165,26 @@ class Cache {
     bool pinned;
   };
   std::list<Node>& list_of(const Node& n) { return n.pinned ? pinned_ : lru_; }
+  // An exact-key Invalidate: an answer already in flight when it arrived carries the older version and must not
+  // re-cache the stale value. Kept kKeyFloorS, far longer than any lookup can be in flight, then forgotten, so a
+  // stream of Invalidates for distinct keys does not grow this without bound.
+  static constexpr std::chrono::seconds kKeyFloorS{60};
+  void set_key_floor(const std::string& id, int64_t version) {
+    auto t = now_();
+    while (!key_floor_order_.empty() && t - key_floor_order_.front().first >= kKeyFloorS) {
+      auto it = key_floors_.find(key_floor_order_.front().second);
+      if (it != key_floors_.end() && it->second.second == key_floor_order_.front().first) key_floors_.erase(it);
+      key_floor_order_.pop_front();
+    }
+    auto& f = key_floors_[id];
+    if (version > f.first) f.first = version;
+    f.second = t;
+    key_floor_order_.emplace_back(t, id);
+  }
+  int64_t key_floor_of(const std::string& id) const {
+    auto it = key_floors_.find(id);
+    return it == key_floors_.end() || now_() - it->second.second >= kKeyFloorS ? 0 : it->second.first;
+  }
   int64_t floor_of(const std::string& tenant, int kind) const {
     int64_t f = 0;
     for (int k : {kind, 0}) {
@@ -172,6 +204,8 @@ class Cache {
   std::list<Node> pinned_;  // survival snapshots: out of the LRU
   std::unordered_map<std::string, std::list<Node>::iterator> index_;
   std::unordered_map<std::string, int64_t> floors_;  // (tenant, kind) -> highest Invalidate version; kept by clear()
+  std::unordered_map<std::string, std::pair<int64_t, Clock::time_point>> key_floors_;  // id -> (version, set at)
+  std::deque<std::pair<Clock::time_point, std::string>> key_floor_order_;              // oldest first, for expiry
   Stats st_;
 };
 
