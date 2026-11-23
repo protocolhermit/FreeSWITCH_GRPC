@@ -1,3 +1,21 @@
+/*
+ * mod_grpc: FreeSWITCH control-plane module (gRPC)
+ * Copyright (C) 2026 Protocol Hermit
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /* Builds the directory XML document for one user (plain C, header-only; shared by the module and its unit test). */
 #ifndef MOD_GRPC_DIRECTORY_XML_H
 #define MOD_GRPC_DIRECTORY_XML_H
@@ -62,6 +80,8 @@ static inline int dx_user_xml(const dx_user_t *u, char *out, size_t outlen)
 	dx_buf_t b = {out, outlen, 1};
 	size_t i;
 	if (!u || !out || !outlen || !u->domain || !u->user || !u->tenant) return 0;
+	/* user is the caller's SIP user and lands in effective_caller_id_number: no "${" (see ag_no_api_expansion) */
+	if (!ag_no_api_expansion(u->user) || !ag_no_api_expansion(u->domain)) return 0;
 	dx_raw(&b, "<document type=\"freeswitch/xml\"><section name=\"directory\"><domain name=\"");
 	dx_esc(&b, u->domain);
 	dx_raw(&b, "\">");
@@ -85,10 +105,12 @@ static inline int dx_user_xml(const dx_user_t *u, char *out, size_t outlen)
 	dx_attr(&b, "<variable name=\"tenant_id\" value=\"", u->tenant, "\"/>");
 	dx_raw(&b, "<variable name=\"user_context\" value=\"default\"/>");
 	dx_attr(&b, "<variable name=\"effective_caller_id_number\" value=\"", u->user, "\"/>");
-	dx_attr(&b, "<variable name=\"effective_caller_id_name\" value=\"", u->name ? u->name : u->user, "\"/>");
+	/* no "${" in a value: FreeSWITCH expands a variable's value recursively (see ag_no_api_expansion), so a display name
+	 * of "${system(...)}" would run whenever something expands ${effective_caller_id_name}. Such a name falls back to the user. */
+	dx_attr(&b, "<variable name=\"effective_caller_id_name\" value=\"", u->name && ag_no_api_expansion(u->name) ? u->name : u->user, "\"/>");
 	for (i = 0; i < u->nvars; i++) {
 		/* ag_var_ok also refuses the reserved names (tenant_id), so the tenant variable cannot be overridden */
-		if (!u->var_names[i] || !u->var_values[i] || !ag_var_ok(u->var_names[i], u->var_allow)) continue;
+		if (!u->var_names[i] || !u->var_values[i] || !ag_var_ok(u->var_names[i], u->var_allow) || !ag_no_api_expansion(u->var_values[i])) continue;
 		dx_attr(&b, "<variable name=\"", u->var_names[i], "\" value=\"");
 		dx_esc(&b, u->var_values[i]);
 		dx_raw(&b, "\"/>");

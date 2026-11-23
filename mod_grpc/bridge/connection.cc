@@ -1,3 +1,21 @@
+/*
+ * mod_grpc: FreeSWITCH control-plane module (gRPC)
+ * Copyright (C) 2026 Protocol Hermit
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 // Connection lifecycle. One worker thread owns it: resolve, ACL, dial, Hello,
 // read loop, reconnect. Each live stream also has a writer thread (single
 // writer, bounded queue) and a heartbeat thread. Blocking callers (lookup,
@@ -120,13 +138,16 @@ std::shared_ptr<Session> gb_bridge::current() {
 
 void gb_bridge::run() {
   std::vector<std::string> eps = split(endpoints, ',');
-  size_t idx = 0;
+  size_t idx = 0, untried = 0;
   int backoff = backoff_min_ms;
   std::minstd_rand rng(std::random_device{}());
   while (!stopping()) {
     auto t0 = std::chrono::steady_clock::now();
     bool established = !eps.empty() && connect_once(eps[idx++ % eps.size()]);
     if (stopping()) break;
+    // A failed endpoint with others still untried: try the next one at once, not after a backoff
+    if (!established && eps.size() > 1 && ++untried < eps.size()) continue;
+    untried = 0;
     // A stream that ended within a minute is a flap, not a recovery: keep backing off.
     bool lasted = established && std::chrono::steady_clock::now() - t0 >= std::chrono::seconds(60);
     backoff = lasted ? backoff_min_ms : std::min(backoff * 2, backoff_max_ms);
@@ -225,6 +246,7 @@ bool gb_bridge::run_stream(const std::string& target, const std::string& host) {
   h->set_boot_id(boot_id);
   h->set_sip_address(sip_address);
   h->set_registration_mode(registration_mode);
+  h->add_features("answer");
   for (auto& t : split(tags, ',')) h->add_tags(t);
 
   // The watchdog cancels the stream when no HelloAck arrives in time.
@@ -255,7 +277,9 @@ bool gb_bridge::run_stream(const std::string& target, const std::string& host) {
   finish_handshake();
   if (!accepted || timed_out) {
     std::string reason = got && ack.has_hello_ack() ? ack.hello_ack().reason() : "";
-    if (accepted) reason = "no RegStreamAck in time";
+    // accepted yet timed out: the watchdog fired after the HelloAck read, during the shard opens or just before
+    // finish_handshake; with no shards it was the HelloAck that came too late
+    if (accepted) reason = reg_streams > 0 ? "no RegStreamAck in time" : "HelloAck too late";
     close_regs(s);
     s->ctx.TryCancel();
     grpc::Status st = s->stream->Finish();
@@ -502,6 +526,8 @@ gb_bridge_t* gb_create(const gb_config_t* cfg, const gb_callbacks_t* cb, void* u
   try {
     if (!cfg || !cb || !cfg->endpoints || !cfg->node_id || !cb->on_state || !cb->on_command) return nullptr;
     static std::once_flag once;
+    // ponytail: setenv races a getenv on another FreeSWITCH thread; gRPC reads this only from the environment, once,
+    // before its first channel, so it must be set here. Setting it in the service's environment is the clean upgrade.
     std::call_once(once, [] { setenv("GRPC_ENABLE_FORK_SUPPORT", "0", 1); });
     auto* b = new gb_bridge(cfg->cache_max_entries > 0 ? static_cast<size_t>(cfg->cache_max_entries) : 10000);
     b->endpoints = cfg->endpoints;

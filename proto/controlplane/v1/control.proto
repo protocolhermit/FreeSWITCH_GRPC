@@ -1,3 +1,21 @@
+/*
+ * mod_grpc: FreeSWITCH control-plane module (gRPC)
+ * Copyright (C) 2026 Protocol Hermit
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 // Convention: every `tenant_id` field on the wire is the tenant's `tenant.uuid`
 // (the CHAR(36) public reference), never the integer `tenant.id` row id.
 syntax = "proto3";
@@ -59,6 +77,8 @@ message Hello {
   string boot_id = 6;
   string sip_address = 7;       // host:port the node's SIP profile listens on; empty when unset
   string registration_mode = 8; // "engine" or "local"; empty when unset
+  // Optional capabilities this node serves, e.g. "answer" (it runs Command.answer). Absent = none.
+  repeated string features = 9;
 }
 
 message HelloAck {
@@ -272,6 +292,7 @@ message Command {
     ConferenceControl conference_control = 19;
     Amd amd = 20;
     MessageWaiting message_waiting = 21;
+    Answer answer = 22;
   }
   // Set only on the last command of a batch, and only when the node must
   // report how it ended (a StepResult echoing this id). Empty: no report.
@@ -426,6 +447,11 @@ message Sleep {
 // Inline only. The node runs the mod_amd application on this session and
 // reports amd_result / amd_cause. The stream path refuses it.
 message Amd {
+  string uuid = 1;
+}
+
+// Answers the call (200 OK). Playback, Collect and Record only pre-answer (early media).
+message Answer {
   string uuid = 1;
 }
 

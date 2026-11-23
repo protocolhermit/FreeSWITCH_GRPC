@@ -1,3 +1,21 @@
+/*
+ * mod_grpc: FreeSWITCH control-plane module (gRPC)
+ * Copyright (C) 2026 Protocol Hermit
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 // Call control: route requests, step reports, call events, command delivery and results.
 #include <cstdlib>
 #include <cstring>
@@ -152,6 +170,10 @@ bool fill(const cp::Command& c, gb_command_t* o, const char* (*str)(const std::s
       o->new_urgent = c.message_waiting().new_urgent();
       o->saved_urgent = c.message_waiting().saved_urgent();
       return true;
+    case cp::Command::kAnswer:
+      o->type = GB_CMD_ANSWER;
+      o->uuid = str(c.answer().uuid());
+      return true;
     default:
       return false;
   }
@@ -253,6 +275,7 @@ int gb_route(gb_bridge_t* b, const gb_route_request_t* req, int timeout_ms, gb_r
     cp::EngineMessage reply;
     int rc = b->call(&m, timeout_ms > 0 ? timeout_ms : 2000, &reply);
     if (rc != GB_OK) return rc;
+    if (reply.body_case() != cp::EngineMessage::kRouteResponse) return GB_ERR_INTERNAL;
     rc = export_commands(reply.route_response(), out);
     if (rc != GB_OK) gb_route_result_free(out);
     return rc;
@@ -322,6 +345,7 @@ int gb_step(gb_bridge_t* b, const gb_step_result_t* s, int timeout_ms, gb_route_
     cp::EngineMessage reply;
     int rc = b->call(&m, timeout_ms > 0 ? timeout_ms : 3000, &reply);
     if (rc != GB_OK) return rc;
+    if (reply.body_case() != cp::EngineMessage::kRouteResponse) return GB_ERR_INTERNAL;
     rc = export_commands(reply.route_response(), out);
     if (rc != GB_OK) gb_route_result_free(out);
     return rc;

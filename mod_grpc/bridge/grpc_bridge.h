@@ -1,3 +1,21 @@
+/*
+ * mod_grpc: FreeSWITCH control-plane module (gRPC)
+ * Copyright (C) 2026 Protocol Hermit
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /* libgrpc_bridge: transport for mod_grpc. Flat C API; no FreeSWITCH headers,
  * no exceptions across it. Callbacks run on bridge threads: they must return
  * quickly, and must not call back into gb_* except gb_send_*. */
@@ -32,6 +50,8 @@ extern "C" {
 #define GB_SURVIVAL_KEY "survival"
 
 /* values match controlplane.v1.CallEventType */
+#define GB_CONF_RECORDING_DONE 1 /* ConfEvent.Type */
+#define GB_CONF_ROOM_READY 2
 #define GB_EVT_CREATED 1
 #define GB_EVT_ANSWERED 2
 #define GB_EVT_DTMF 3
@@ -56,6 +76,7 @@ extern "C" {
 #define GB_CMD_CONFERENCE_CONTROL 16
 #define GB_CMD_AMD 17
 #define GB_CMD_MESSAGE_WAITING 18
+#define GB_CMD_ANSWER 19
 
 #define GB_LOG_ERR 0
 #define GB_LOG_WARN 1
@@ -82,7 +103,7 @@ typedef struct {
 } gb_data_res_t;
 /* One uncached round trip to the engine's data API. GB_OK (out->version, out->value for GET/INCR); GB_ERR_NOT_FOUND (get);
  * GB_ERR_CONFLICT (out->version = current); GB_ERR_UNAVAILABLE; GB_ERR_ENGINE (out->error); GB_ERR_TIMEOUT;
- * GB_ERR_DISCONNECTED; GB_ERR_ARG (NULL or bad op). Never touches the cache. */
+ * GB_ERR_DISCONNECTED; GB_ERR_ARG (NULL, bad op, or tenant/key/value not UTF-8). Never touches the cache. */
 int gb_data(gb_bridge_t *b, const gb_data_req_t *r, int timeout_ms, gb_data_res_t *out);
 void gb_data_res_free(gb_data_res_t *r);
 /* 1 when the live session's HelloAck listed the feature */
@@ -201,7 +222,8 @@ typedef struct {
 } gb_lookup_result_t;
 
 /* Cache first; on a miss asks the engine. When the engine cannot be reached
- * a stale entry is served rather than an error (fail-static). */
+ * a stale entry is served rather than an error (fail-static). A tenant or key that is not UTF-8 is never sent
+ * (GB_ERR_ARG, unless a cached entry answers); gb_fetch refuses it the same way. */
 int gb_lookup(gb_bridge_t *b, const char *tenant, int kind, const char *key, int timeout_ms, gb_lookup_result_t *out);
 void gb_lookup_result_free(gb_lookup_result_t *r);
 

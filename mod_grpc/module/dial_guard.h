@@ -1,3 +1,21 @@
+/*
+ * mod_grpc: FreeSWITCH control-plane module (gRPC)
+ * Copyright (C) 2026 Protocol Hermit
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /* Dial-string guards for mod_grpc. Plain C with no FreeSWITCH dependency so the unit tests can include it. */
 #pragma once
 #include <string.h>
@@ -80,6 +98,26 @@ static inline int dg_dialer_var_ok(const char *key, const char *value)
 	return 0;
 }
 
+/* A variable an Originate command may put in the leg's {k=v} block: a plain name (1-64 of [A-Za-z0-9_-], so no ',',
+ * '=' or "nolocal:" prefix) that is not one FreeSWITCH runs as an API or application, or transfers the call to, later,
+ * nor one it plays as media (ringback, hold music): those take any path or stream (shell_stream://, another tenant's
+ * recording), which sg_safe_prompt refuses everywhere else. Channel variable names are case-insensitive, so the prefixes are too. */
+static inline int dg_originate_var_ok(const char *key)
+{
+	static const char *const deny[] = {"api_", "execute_", "exec_", "bridge_pre_execute", "session_in_hangup_hook",
+									   "record_post_process_exec", "transfer_after_", "park_after_", "transfer_on_fail",
+									   "force_transfer_", "group_confirm_", "ringback", "transfer_ringback", "hold_music",
+									   "temp_hold_music", NULL};
+	const char *const *d;
+	if (!key || !dg_safe_ident(key, strlen(key))) return 0;
+	for (d = deny; *d; d++) {
+		size_t n = strlen(*d), i;
+		for (i = 0; i < n && key[i] && ((key[i] >= 'A' && key[i] <= 'Z') ? key[i] + 32 : key[i]) == (*d)[i]; i++);
+		if (i == n) return 0;
+	}
+	return 1;
+}
+
 /* One "[k=v,k=v]" block starting at *pp (which points at '['); leaves *pp after the ']'. Only these keys pass:
  * sip_h_X-Tenant-Id (value = the command's tenant, which must be UUID-shaped: the claim the edge checks on legs to it),
  * leg_timeout and leg_delay_start (1 to 3 digits),
@@ -154,7 +192,9 @@ static inline int dg_leg_block(const char **pp, const char *tenant, int *cid)
 static inline int dg_safe_dial(const char *v, const char *tenant)
 {
 	const char *p = v;
-	if (!dg_safe_value(v)) return 0;
+	/* ":_:" splits the string into separately originated legs (enterprise originate): each would escape the
+	 * per-leg rules here and in every caller that splits only on ',' and '|' (ag_dial_endpoints_ok, dg_single_leg) */
+	if (!dg_safe_value(v) || strstr(v, ":_:")) return 0;
 	for (;;) {
 		const char *body;
 		int cid = 0;

@@ -1,3 +1,21 @@
+/*
+ * mod_grpc: FreeSWITCH control-plane module (gRPC)
+ * Copyright (C) 2026 Protocol Hermit
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 // In-process lookup cache: TTL, per-entry version, LRU cap. Header-only so the
 // unit test needs no gRPC. Thread-safe.
 #pragma once
@@ -40,7 +58,10 @@ class Cache {
     std::lock_guard<std::mutex> l(mu_);
     std::string id = make_id(tenant, kind, key);
     // version 0 = unversioned, exempt; otherwise refuse answers older than a seen Invalidate (wildcard or this key)
-    if (version != 0 && (version < floor_of(tenant, kind) || version < key_floor_of(id))) return;
+    // (a kind-0 exact Invalidate keeps its floor under kind 0: it covers this key in every kind)
+    if (version != 0 && (version < floor_of(tenant, kind) || version < key_floor_of(id) ||
+                         version < key_floor_of(make_id(tenant, 0, key))))
+      return;
     auto it = index_.find(id);
     if (it != index_.end()) {
       list_of(*it->second).erase(it->second);
@@ -101,14 +122,24 @@ class Cache {
     if (key == "*") {
       int64_t& f = floors_[make_id(tenant, kind, "")];
       if (version > f) f = version;
-    } else if (kind != 0) {
-      set_key_floor(make_id(tenant, kind, key), version);
+    } else {
+      set_key_floor(make_id(tenant, kind, key), version);  // kind 0: put checks the kind-0 id for every kind
     }
     size_t dropped = 0;
+    if (key != "*" && kind != 0) {  // one exact entry: the index finds it, no scan of every entry under the lock
+      auto it = index_.find(make_id(tenant, kind, key));
+      if (it != index_.end() && (version == 0 || it->second->e.version < version)) {  // version 0 = unversioned: drop
+        list_of(*it->second).erase(it->second);
+        index_.erase(it);
+        dropped = 1;
+      }
+      st_.invalidated += dropped;
+      return dropped;
+    }
     for (auto* l : {&lru_, &pinned_})
       for (auto it = l->begin(); it != l->end();) {
         bool match = it->tenant == tenant && (kind == 0 || it->kind == kind) && (key == "*" || it->key == key) &&
-                     it->e.version < version;
+                     (version == 0 || it->e.version < version);
         if (match) {
           index_.erase(it->id);
           it = l->erase(it);

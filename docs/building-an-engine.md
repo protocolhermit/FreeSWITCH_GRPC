@@ -11,6 +11,10 @@ Every FreeSWITCH node running `mod_grpc` connects to it and asks it how to:
 You can write it in any gRPC language. This guide uses Go, which is what the
 proto's `go_package` option targets.
 
+New to this? Start with [getting-started.md](getting-started.md). For a ready-made
+snippet per situation (IVR, voicemail, queue, conference, dialer, ...) see
+[engine-examples.md](engine-examples.md).
+
 Read [protocol.md](protocol.md) first. This guide shows how the pieces fit
 together in code.
 
@@ -724,7 +728,8 @@ mailbox, never in the number of tenants, agents or messages.
 
 Flow:
 
-1. The caller arrives. `ZADD` it to the queue, O(log n), and `Park` it. Start
+1. The caller arrives. `Answer` it (so it is not dropped as unanswered while
+   it waits), `ZADD` it to the queue, O(log n), and `Park` it. Start
    hold music with a stream `Playback` of `local_stream://<name>`, on the
    parked caller.
 2. To pick an agent, `ZPOPMIN` the availability set, O(log n). Read the agent's
@@ -760,7 +765,7 @@ agents:
 | `vm:{t}:msgs:{user}:new` and `vm:{t}:msgs:{user}:saved` | sorted sets | Message ids, scored by time |
 | `vm:{t}:msg:{id}` | hash | Caller id, length, object |
 
-Leaving a message:
+Leaving a message (send `Answer` first; the node never answers on its own):
 
 1. `Playback` with `url` set to a presigned GET of the greeting object,
    after `HGETALL` of the box, O(1).
@@ -782,7 +787,7 @@ this after every change to the counts: a new message, a save, a delete.
 
 Listening:
 
-1. `Collect` the PIN, then compare with the stored hash.
+1. `Answer`, then `Collect` the PIN, then compare with the stored hash.
 2. Run the menu as a multi-step call: `Collect` for the choice, then `Playback`
    with a presigned `url` for the message. Fetch ids ten at a time with
    `ZRANGE vm:{t}:msgs:{user}:new (<last score> +inf BYSCORE LIMIT 0 10`, where

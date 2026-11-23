@@ -17,6 +17,7 @@ SIP edge (e.g. Kamailio) ──SIP──▶ FreeSWITCH + mod_grpc ══gRPC str
 - A SIP edge is optional. Without Kamailio, the node can take phone
   registrations itself. See §9.
 
+New to FreeSWITCH or gRPC? Read [getting-started.md](getting-started.md) first.
 See [protocol.md](protocol.md) for the wire contract and
 [building-an-engine.md](building-an-engine.md) to write the server side.
 
@@ -139,6 +140,7 @@ Add `<load module="mod_grpc"/>` to `modules.conf.xml`, or run `load mod_grpc` fr
 | `media-cache-max` | `1073741824` | Cache size cap in bytes. Over it, the oldest files go first (the file just fetched is never removed). A value below `media-max-bytes` is raised to it, with a warning. |
 | `media-max-bytes` | `20971520` | Per-file download cap. |
 | `media-fetch-timeout` | `10` | Seconds per download. |
+| `upload-hosts` | – | Comma-separated host names a recording's `upload_url` (Record, conference recording) may PUT to, matched like `media-hosts`. A URL to any other host is refused (`record: bad upload url`). Empty (the default) allows any http or https host. |
 | `<domain-tenants>` | – | A block next to `<settings>`: `<domain name="acme.example" tenant="<uuid>"/>`. Maps a domain to a tenant without asking the engine. Used in `local` mode only. |
 
 The module **refuses to load** in these cases:
@@ -333,8 +335,12 @@ the caller hears silence meanwhile.
 - Only `.wav`, `.mp3` and `.ogg`, from a listed host, over http or https.
   Redirects are not followed. A non-2xx answer is the error `fetch: http <code>`
   and is never cached.
-- The cache key is the host and object path. The scheme, port and query string
-  are ignored, so one object path must always hold the same content.
+- The cache key is the call's tenant, the host and the object path. The
+  scheme, port and query string are ignored, so one object path must always
+  hold the same content. Because the signature is not part of the key, each
+  tenant downloads its own copy: one tenant never plays another's cached file.
+  A call whose `tenant_id` is not UUID-shaped cannot play URLs
+  (`fetch: no tenant`).
 - URLs work only in a call's own route or step answer. On the stream path they
   are refused.
 - `local_stream://<name>` is accepted in prompts. The stream itself comes from

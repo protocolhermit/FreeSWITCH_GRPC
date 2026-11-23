@@ -1,3 +1,21 @@
+/*
+ * mod_grpc: FreeSWITCH control-plane module (gRPC)
+ * Copyright (C) 2026 Protocol Hermit
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /* mod_grpc/module/media_fetch.h
  * URL rules for remote media (Playback.url, Collect.prompt_url). Plain C with no FreeSWITCH dependency so the unit
  * tests can include it. */
@@ -40,14 +58,14 @@ static inline const char *mf_ext(const char *path, size_t n)
 	return NULL;
 }
 
-/* 1 when url passes sg_safe_url, is http(s) with no userinfo ('@' before the path), its host (exact, case-insensitive,
- * port stripped) is in the comma-separated hosts list, and the path (before '?' or '#') ends in .wav/.mp3/.ogg. */
-static inline int mf_url_ok(const char *url, const char *hosts)
+/* 1 when url passes sg_safe_url, is http(s) with no userinfo ('@' before the path) and an object path, and its host
+ * (exact, case-insensitive, port stripped) is in the comma-separated hosts list. */
+static inline int mf_host_ok(const char *url, const char *hosts)
 {
 	char host[256];
 	const char *path, *h;
 	size_t pn, hn;
-	if (!hosts || !*hosts || !mf_split(url, host, sizeof host, &path, &pn) || !mf_ext(path, pn)) return 0;
+	if (!hosts || !*hosts || !mf_split(url, host, sizeof host, &path, &pn)) return 0;
 	hn = strlen(host);
 	for (h = hosts; *h;) {
 		const char *e = h + strcspn(h, ",");
@@ -60,23 +78,55 @@ static inline int mf_url_ok(const char *url, const char *hosts)
 	return 0;
 }
 
-/* True for exactly an mf_cache_name shape: 16 lowercase hex digits then .wav, .mp3 or .ogg. */
-static inline int mf_is_cache_name(const char *n)
+/* mf_host_ok, and the path (before '?' or '#') ends in .wav/.mp3/.ogg: a URL remote media may play. */
+static inline int mf_url_ok(const char *url, const char *hosts)
+{
+	char host[256];
+	const char *path;
+	size_t pn;
+	return mf_host_ok(url, hosts) && mf_split(url, host, sizeof host, &path, &pn) && mf_ext(path, pn);
+}
+
+/* A presigned upload target: sg_safe_url, and when hosts is set (upload-hosts) also mf_host_ok. Unset keeps any
+ * http(s) host, as before the setting existed. */
+static inline int mf_upload_ok(const char *url, const char *hosts)
+{
+	return sg_safe_url(url) && (!hosts || !*hosts || mf_host_ok(url, hosts));
+}
+
+/* 16 lowercase hex digits then .wav, .mp3 or .ogg, and nothing after */
+static inline int mf_is_hash_ext(const char *n)
 {
 	int i;
 	for (i = 0; i < 16; i++) if (!((n[i] >= '0' && n[i] <= '9') || (n[i] >= 'a' && n[i] <= 'f'))) return 0;
 	return !strcmp(n + 16, ".wav") || !strcmp(n + 16, ".mp3") || !strcmp(n + 16, ".ogg");
 }
 
-/* "<16 hex of FNV-1a 64 of host+path>.<ext>" for an mf_url_ok url; 0 when it does not fit. */
-static inline int mf_cache_name(const char *url, char *out, size_t outlen)
+/* True for exactly an mf_cache_name shape, "<lowercase uuid>-<16 hex>.<ext>", or the bare "<16 hex>.<ext>" an older
+ * build wrote: both are this module's files, so eviction may remove them (an old file is never played again). */
+static inline int mf_is_cache_name(const char *n)
 {
-	char host[256];
+	int i;
+	if (mf_is_hash_ext(n)) return 1;
+	for (i = 0; i < 36; i++)
+		if (!n[i] || !((n[i] >= '0' && n[i] <= '9') || (n[i] >= 'a' && n[i] <= 'f') || n[i] == '-')) return 0;
+	return n[36] == '-' && mf_is_hash_ext(n + 37);
+}
+
+/* "<tenant>-<16 hex of FNV-1a 64 of host+path>.<ext>" for an mf_url_ok url; 0 when the tenant is not UUID-shaped or
+ * the name does not fit. The query (the presigned signature) is not in the key, so the tenant is: without it one
+ * tenant could play another's cached object by naming its path. It is literal, not hashed, so no crafted path can
+ * collide across tenants. The tenant is lowercased so one tenant always has one spelling. */
+static inline int mf_cache_name(const char *tenant, const char *url, char *out, size_t outlen)
+{
+	char host[256], t[37];
 	const char *path, *ext;
 	size_t pn, i;
 	uint64_t h = 0xcbf29ce484222325ULL;
-	if (!mf_split(url, host, sizeof host, &path, &pn) || !(ext = mf_ext(path, pn))) return 0;
+	if (!dg_uuid_shaped(tenant) || !mf_split(url, host, sizeof host, &path, &pn) || !(ext = mf_ext(path, pn))) return 0;
+	for (i = 0; i < 36; i++) t[i] = (tenant[i] >= 'A' && tenant[i] <= 'F') ? (char) (tenant[i] + 32) : tenant[i];
+	t[36] = 0;
 	for (i = 0; host[i]; i++) h = (h ^ (unsigned char) host[i]) * 0x100000001b3ULL;
 	for (i = 0; i < pn; i++) h = (h ^ (unsigned char) path[i]) * 0x100000001b3ULL;
-	return snprintf(out, outlen, "%016llx%s", (unsigned long long) h, ext) < (int) outlen;
+	return snprintf(out, outlen, "%s-%016llx%s", t, (unsigned long long) h, ext) < (int) outlen;
 }

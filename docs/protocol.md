@@ -24,9 +24,10 @@ string. An empty `tenant_id` means a node-level request, for example a domain
 
 ```proto
 message NodeMessage   { string request_id = 1; oneof body { Hello, Heartbeat, LookupRequest, RouteRequest,
-                                                            CallEvent, CommandResult, StepResult, ConfEvent, RegEvent } }
+                                                            CallEvent, CommandResult, StepResult, ConfEvent, RegEvent,
+                                                            DataRequest } }
 message EngineMessage { string request_id = 1; oneof body { HelloAck, LookupResponse, Invalidate,
-                                                            RouteResponse, Command, TokenRotate } }
+                                                            RouteResponse, Command, TokenRotate, DataResponse } }
 ```
 
 `request_id` ties a reply to its request. The engine **must echo the
@@ -60,7 +61,7 @@ timeouts are:
 
 ```proto
 message Hello    { string node_id; string version; string token; repeated string tags; int32 capacity; string boot_id;
-                    string sip_address; string registration_mode; }
+                    string sip_address; string registration_mode; repeated string features; }
 message HelloAck { bool accepted; string reason; string session_id; int32 heartbeat_interval_s; repeated string features; }
 message Heartbeat{ int32 active_calls; int32 cpu_pct; int64 ts_unix_ms; }
 ```
@@ -81,7 +82,12 @@ message Heartbeat{ int32 active_calls; int32 cpu_pct; int64 ts_unix_ms; }
   profile (the `sip-address` setting). Empty when unset.
 - `registration_mode` (8) is `"local"` or `"engine"`. It is **empty in `edge`
   mode**, so an edge node's `Hello` is unchanged.
-- `features` (5) lists the optional capabilities the engine serves: `"data"`
+- `Hello.features` (9) lists the optional capabilities the node serves:
+  `"answer"` (it runs `Command.answer`). Check for it before relying on
+  `Answer`. An older node leaves it empty: inline it fails `Answer` with
+  `unknown command type 0`, and on the stream it drops the command without
+  a `CommandResult`.
+- `HelloAck.features` (5) lists the optional capabilities the engine serves: `"data"`
   (it answers `DataRequest`), `"media_url"` (it sends `Playback.url` and
   `Collect.prompt_url`) and `"mwi"` (it sends `MessageWaiting`). Absent means
   none. Only `"data"` changes node behaviour: without it, `grpc data` answers
@@ -290,6 +296,7 @@ There are two ways a command arrives:
 | `Originate` | `dial_string`, `vars`, `timeout_s`, `route_on_answer` | Places a new call. The leg carries `X-Tenant-Id`. With `route_on_answer`, the answered leg comes back to you as a fresh `RouteRequest` (domain `dialer.invalid`, identified by `dialer_token`) instead of being parked. |
 | `Bridge` | `uuid`, `dial_string`, `timeout_s`, `peer_tenant_id`, `peer_caller_id`, `peer_addresses`, `peer_target` | Bridges the call to a dial string. See "Peer legs" below. |
 | `BridgeLegs` | `uuid_a`, `uuid_b` | Bridges two existing legs |
+| `Answer` | `uuid` | Answers the call (200 OK). Already answered: ok, nothing happens. `Playback`, `Collect` and `Record` only pre-answer (early media), so send `Answer` first for anything longer than a short prompt: carrier timers drop an unanswered call after 60 to 180 s, many devices send no audio before answer, and billing starts at answer. |
 | `Park` | `uuid` | Parks the call |
 | `Playback` | `uuid`, `file`, `url` | Plays a file or stream. `url` replaces `file`: see "Remote media" below. |
 | `Hangup` | `uuid`, `cause` | Hangs up with that cause |
@@ -337,7 +344,8 @@ A node with none does nothing.
 
 - `domain` must resolve to the command's `tenant_id`, or the result is
   `mwi: domain not in tenant`. `user` and `domain` must be safe names, or
-  `mwi: bad user or domain`. A negative count gives `mwi: bad counts`.
+  `mwi: bad user or domain`. `user` may start with one `+` (E.164, e.g.
+  `+15551234567`). A negative count gives `mwi: bad counts`.
 - Messages waiting is `yes` when `new_msgs` or `new_urgent` is above 0.
 
 ### Peer legs (`engine` mode)

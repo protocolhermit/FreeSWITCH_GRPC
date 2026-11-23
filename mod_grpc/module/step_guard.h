@@ -1,3 +1,21 @@
+/*
+ * mod_grpc: FreeSWITCH control-plane module (gRPC)
+ * Copyright (C) 2026 Protocol Hermit
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /* mod_grpc/module/step_guard.h
  * Argument guards for the inline primitives (Collect, Record, Conference,
  * Sleep). Plain C with no FreeSWITCH dependency so the unit tests can include
@@ -19,6 +37,12 @@ static inline int sg_safe_name(const char *v)
 		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '-' || c == '.')) return 0;
 	}
 	return 1;
+}
+
+/* An MWI user: a safe name, or one leading '+' (E.164) and then a safe name. */
+static inline int sg_mwi_user(const char *v)
+{
+	return v && (*v == '+' ? v[1] != '+' && sg_safe_name(v + 1) : sg_safe_name(v));
 }
 
 /* Empty is fine (no terminator); otherwise up to 4 of "0123456789#*". */
@@ -148,7 +172,7 @@ static inline int sg_conf_flags(char *out, size_t n, int mute, int moderator, in
 	return w > 0 && (size_t) w < n;
 }
 
-enum { SG_CONF_MUTE = 1, SG_CONF_UNMUTE, SG_CONF_MUTE_ALL, SG_CONF_UNMUTE_ALL, SG_CONF_KICK, SG_CONF_LOCK, SG_CONF_UNLOCK, SG_CONF_END };
+enum { SG_CONF_MUTE = 1, SG_CONF_UNMUTE, SG_CONF_MUTE_ALL, SG_CONF_UNMUTE_ALL, SG_CONF_KICK, SG_CONF_LOCK, SG_CONF_UNLOCK, SG_CONF_END, SG_CONF_RECORD_START, SG_CONF_RECORD_STOP };
 
 /* A FreeSWITCH conference member id: decimal digits only, so "all", "last" and "non_moderator" can never come from a caller. */
 static inline int sg_conf_member_id(const char *v)

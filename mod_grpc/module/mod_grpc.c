@@ -1,4 +1,22 @@
 /*
+ * mod_grpc: FreeSWITCH control-plane module (gRPC)
+ * Copyright (C) 2026 Protocol Hermit
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/*
  * mod_grpc -- FreeSWITCH side of the control-plane stream.
  *
  * Thin shell: all transport (stream, cache, reconnect, TLS) is in
@@ -85,6 +103,7 @@ static struct {
 	unsigned reg_events_sent;
 	int data_timeout_ms;          /* data-timeout, default 1500 */
 	char *media_hosts, *media_cache_dir; /* media-hosts (empty = remote media off), media-cache-dir */
+	char *upload_hosts;           /* upload-hosts: hosts a recording may be PUT to (empty = any http(s) host) */
 	int64_t media_cache_max, media_max_bytes; /* media-cache-max, media-max-bytes */
 	int media_fetch_timeout_s;    /* media-fetch-timeout */
 	unsigned media_fetches, media_cache_hits; /* downloads done, and plays served from the cache (state_mutex) */
@@ -303,8 +322,10 @@ static switch_bool_t exec_originate(const cmd_item_t *c, char *err, size_t errle
 	char args[4096];
 	size_t i, n = 0;
 	const int routed = c->route_on_answer;
-	if (!zstr(c->peer_tenant_id) || !zstr(c->peer_caller_id) || !c->tenant_id[0] || !safe_value(c->tenant_id) || !safe_dial(c->dial_string, NULL) ||
-		(routed && (!dg_uuid_shaped(c->tenant_id) || !dg_single_leg(c->dial_string)))) {
+	/* the tenant goes unquoted into {tenant_id=...}: a ',' would start a variable of the engine's choosing */
+	if (!zstr(c->peer_tenant_id) || !zstr(c->peer_caller_id) || !dg_uuid_shaped(c->tenant_id) || /* tenant ids are UUIDs: nothing else goes unquoted into {tenant_id=...} */
+		!safe_dial(c->dial_string, NULL) ||
+		(routed && !dg_single_leg(c->dial_string))) {
 		switch_snprintf(err, errlen, "originate: bad tenant or dial string");
 		return SWITCH_FALSE;
 	}
@@ -313,7 +334,7 @@ static switch_bool_t exec_originate(const cmd_item_t *c, char *err, size_t errle
 	if (routed && !sappend(args, sizeof(args), &n, ",domain_name=dialer.invalid")) goto too_long;
 	if (c->timeout_s > 0 && !sappend(args, sizeof(args), &n, ",originate_timeout=%d", c->timeout_s)) goto too_long;
 	for (i = 0; i < c->nvars; i++) {
-		if (!safe_value(c->keys[i]) || !safe_value(c->values[i]) || strpbrk(c->keys[i], ",= \t")) {
+		if (!dg_originate_var_ok(c->keys[i]) || !safe_value(c->values[i])) { /* no api_on_answer, execute_on_*, ... */
 			switch_snprintf(err, errlen, "originate: bad variable %s", c->keys[i]);
 			return SWITCH_FALSE;
 		}
@@ -321,7 +342,8 @@ static switch_bool_t exec_originate(const cmd_item_t *c, char *err, size_t errle
 			switch_snprintf(err, errlen, "originate: variable %s not allowed on a routed leg", c->keys[i]);
 			return SWITCH_FALSE;
 		}
-		if (!strcmp(c->keys[i], "tenant_id") || !strcasecmp(c->keys[i], "sip_h_X-Tenant-Id")) continue; /* the command's tenant wins */
+		/* the command's tenant wins; channel variable names are case-insensitive, so TENANT_ID must not override it */
+		if (!strcasecmp(c->keys[i], "tenant_id") || !strcasecmp(c->keys[i], "sip_h_X-Tenant-Id")) continue;
 		if (!sappend(args, sizeof(args), &n, ",%s='%s'", c->keys[i], c->values[i])) goto too_long;
 	}
 	if (!sappend(args, sizeof(args), &n, "}%s %s", c->dial_string, routed ? "&grpc_route()" : "&park()")) goto too_long;
@@ -357,7 +379,7 @@ static switch_bool_t exec_conference_control(const cmd_item_t *c, char *err, siz
 		return SWITCH_FALSE;
 	}
 	/* 9 = RECORD_START, 10 = RECORD_STOP. Before sg_conf_control, which has no recording arm. */
-	if (c->conf_action == 9 || c->conf_action == 10) return exec_conf_record(c, room, err, errlen);
+	if (c->conf_action == SG_CONF_RECORD_START || c->conf_action == SG_CONF_RECORD_STOP) return exec_conf_record(c, room, err, errlen);
 	/* End kicks everyone, but the known recording stops by its saved path first. The job stays until upload. */
 	if (c->conf_action == SG_CONF_END) cr_end_stop(room);
 	if (c->conf_action == SG_CONF_MUTE || c->conf_action == SG_CONF_UNMUTE || c->conf_action == SG_CONF_KICK) {
@@ -393,7 +415,7 @@ static switch_bool_t exec_message_waiting(const cmd_item_t *c, char *err, size_t
 	char tenant[64], voice[64], acct[256];
 	switch_event_t *ev = NULL;
 
-	if (zstr(c->user) || zstr(c->domain) || !sg_safe_name(c->user) || !sg_safe_name(c->domain)) {
+	if (zstr(c->user) || zstr(c->domain) || !sg_mwi_user(c->user) || !sg_safe_name(c->domain)) {
 		switch_snprintf(err, errlen, "mwi: bad user or domain");
 		return SWITCH_FALSE;
 	}
@@ -424,7 +446,7 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 	char pdial[PEER_DIAL_MAX];
 	int ctl = 1;
 
-	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_MESSAGE_WAITING) { /* AMD (inline only) falls to the default case */
+	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_ANSWER) { /* AMD (inline only) falls to the default case */
 		switch_snprintf(err, errlen, "unknown command type %d", c->type);
 		return SWITCH_FALSE;
 	}
@@ -478,8 +500,9 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 			switch_core_session_rwunlock(target);
 		}
 		if (c->timeout_s > 0) {
-			switch_snprintf(args, sizeof(args), "%s call_timeout=%d", c->uuid, c->timeout_s);
-			run_api("uuid_setvar", args, err, errlen);
+			/* "<uuid> <var> <value>": uuid_setvar splits on the first space; "call_timeout=N" set a variable of that whole name */
+			switch_snprintf(args, sizeof(args), "%s call_timeout %d", c->uuid, c->timeout_s);
+			if (!run_api("uuid_setvar", args, err, errlen)) return SWITCH_FALSE; /* the bridge would ring without its timeout */
 		}
 		/* snprintf, not switch_snprintf: its return is the needed length, so a cut-off dial string is refused, never run */
 		if (snprintf(args, sizeof(args), "%s bridge::%s aleg", c->uuid, c->npeers ? pdial : c->dial_string) >= (int) sizeof(args)) {
@@ -489,6 +512,8 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 		return run_api("uuid_broadcast", args, err, errlen);
 	case GB_CMD_PARK:
 		return run_api("uuid_park", c->uuid, err, errlen);
+	case GB_CMD_ANSWER:
+		return run_api("uuid_answer", c->uuid, err, errlen);
 	case GB_CMD_PLAYBACK:
 		if (!zstr(c->url)) {
 			switch_snprintf(err, errlen, "playback: url is inline only");
@@ -503,9 +528,13 @@ static switch_bool_t exec_command(const cmd_item_t *c, char *err, size_t errlen)
 			return SWITCH_FALSE;
 		}
 		return run_api("uuid_broadcast", args, err, errlen);
-	case GB_CMD_HANGUP:
-		switch_snprintf(args, sizeof(args), "%s %s", c->uuid, c->cause[0] ? c->cause : "NORMAL_CLEARING");
+	case GB_CMD_HANGUP: {
+		/* the canonical name, never the engine's text: an empty or unknown cause is NORMAL_CLEARING, as on the inline path
+		 * (str2cause gives NONE for those, and uuid_kill would hang up with NONE) */
+		switch_call_cause_t cause = switch_channel_str2cause(c->cause);
+		switch_snprintf(args, sizeof(args), "%s %s", c->uuid, switch_channel_cause2str(cause ? cause : SWITCH_CAUSE_NORMAL_CLEARING));
 		return run_api("uuid_kill", args, err, errlen);
+	}
 	case GB_CMD_SUPERVISE_MODE: {
 		char digit = sg_supervise_mode_dtmf(c->mode);
 		switch_core_session_t *s;
@@ -927,11 +956,25 @@ static void media_evict(const char *dir, const char *keep)
 	}
 }
 
-/* Fetched or cached local path for url in out; false with err set. Runs on the session thread (up to
- * media-fetch-timeout seconds of silence for the caller). */
-static switch_bool_t media_local(const char *url, char *out, size_t outlen, char *err, size_t errlen)
+/* switch_dir_make_recursive allocates from the pool it is given: a short-lived one, so a caller on a long-lived
+ * thread (the command thread, a session that plays many URLs) never grows a pool that outlives it. */
+static switch_status_t make_dir(const char *dir)
 {
-	char name[40], tmp[1100];
+	switch_memory_pool_t *mp = NULL;
+	switch_status_t st = SWITCH_STATUS_FALSE;
+	if (switch_core_new_memory_pool(&mp) == SWITCH_STATUS_SUCCESS) {
+		st = switch_dir_make_recursive(dir, SWITCH_DEFAULT_DIR_PERMS, mp);
+		switch_core_destroy_memory_pool(&mp);
+	}
+	return st;
+}
+
+/* Fetched or cached local path for url in out; false with err set. Runs on the session thread (up to
+ * media-fetch-timeout seconds of silence for the caller). tenant is the channel's own (channel_tenant): the cache is
+ * per tenant, because the presigned signature is not part of the cache key. */
+static switch_bool_t media_local(const char *tenant, const char *url, char *out, size_t outlen, char *err, size_t errlen)
+{
+	char name[64], tmp[1100]; /* name: "<uuid>-<16 hex>.<ext>", 57 bytes and the NUL */
 	struct stat st;
 	media_sink_t sink = { 0 };
 	CURL *cu;
@@ -941,8 +984,8 @@ static switch_bool_t media_local(const char *url, char *out, size_t outlen, char
 		switch_snprintf(err, errlen, "fetch: no media-hosts");
 		return SWITCH_FALSE;
 	}
-	if (!mf_url_ok(url, globals.media_hosts) || !mf_cache_name(url, name, sizeof(name))) {
-		switch_snprintf(err, errlen, "fetch: not allowed");
+	if (!mf_url_ok(url, globals.media_hosts) || !mf_cache_name(tenant, url, name, sizeof(name))) {
+		switch_snprintf(err, errlen, tenant ? "fetch: not allowed" : "fetch: no tenant");
 		return SWITCH_FALSE;
 	}
 	if (snprintf(out, outlen, "%s/%s", globals.media_cache_dir, name) >= (int) outlen || snprintf(tmp, sizeof(tmp), "%s.tmp.%lu", out, (unsigned long) pthread_self()) >= (int) sizeof(tmp)) {
@@ -956,17 +999,9 @@ static switch_bool_t media_local(const char *url, char *out, size_t outlen, char
 		switch_mutex_unlock(globals.state_mutex);
 		return SWITCH_TRUE;
 	}
-	{ /* switch_dir_make_recursive allocates from its pool: a short-lived one, never NULL */
-		switch_memory_pool_t *mp = NULL;
-		switch_status_t ds = SWITCH_STATUS_FALSE;
-		if (switch_core_new_memory_pool(&mp) == SWITCH_STATUS_SUCCESS) {
-			ds = switch_dir_make_recursive(globals.media_cache_dir, SWITCH_DEFAULT_DIR_PERMS, mp);
-			switch_core_destroy_memory_pool(&mp);
-		}
-		if (ds != SWITCH_STATUS_SUCCESS) {
-			switch_snprintf(err, errlen, "fetch: cache dir");
-			return SWITCH_FALSE;
-		}
+	if (make_dir(globals.media_cache_dir) != SWITCH_STATUS_SUCCESS) {
+		switch_snprintf(err, errlen, "fetch: cache dir");
+		return SWITCH_FALSE;
 	}
 	if (!(sink.fp = fopen(tmp, "wb"))) {
 		switch_snprintf(err, errlen, "fetch: cache dir");
@@ -985,7 +1020,8 @@ static switch_bool_t media_local(const char *url, char *out, size_t outlen, char
 	curl_easy_setopt(cu, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t) globals.media_max_bytes);
 	curl_easy_setopt(cu, CURLOPT_FAILONERROR, 1L);
 	curl_easy_setopt(cu, CURLOPT_NOSIGNAL, 1L);
-	curl_easy_setopt(cu, CURLOPT_PROTOCOLS, (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
+	curl_easy_setopt(cu, CURLOPT_PROTOCOLS_STR, "http,https");
+	curl_easy_setopt(cu, CURLOPT_PROXY, ""); /* ignore env proxies, as upload_file does: media-hosts names the host we reach */
 	curl_easy_setopt(cu, CURLOPT_WRITEFUNCTION, media_write);
 	curl_easy_setopt(cu, CURLOPT_WRITEDATA, &sink);
 	rc = curl_easy_perform(cu);
@@ -1037,7 +1073,7 @@ static switch_bool_t inline_collect(switch_core_session_t *session, const gb_com
 			switch_snprintf(err, errlen, "collect: bad arguments");
 			return SWITCH_FALSE;
 		}
-		if (!media_local(c->url, media, sizeof(media), err, errlen)) return SWITCH_FALSE;
+		if (!media_local(channel_tenant(channel), c->url, media, sizeof(media), err, errlen)) return SWITCH_FALSE;
 		prompt = media;
 	} else if (!sg_safe_prompt(c->file, globals.record_dir, channel_tenant(channel)) || !sg_safe_terminators(c->terminators) || !sg_collect_ok(c->min_digits, c->max_digits, c->timeout_ms)) {
 		switch_snprintf(err, errlen, "collect: bad arguments");
@@ -1141,7 +1177,7 @@ static void cr_send_done(const char *tenant, const char *room, const char *rec_i
 {
 	int rc;
 	if (length_ms < 0) length_ms = 0;
-	rc = gb_send_conf_event(globals.bridge, 1 /* RECORDING_DONE */, tenant, room, rec_id, length_ms, uploaded, "", "");
+	rc = gb_send_conf_event(globals.bridge, GB_CONF_RECORDING_DONE, tenant, room, rec_id, length_ms, uploaded, "", "");
 	if (rc != GB_OK)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "conference recording %s completion not sent; recovery left to the pending sweep\n", rec_id ? rec_id : "");
 }
@@ -1371,7 +1407,7 @@ static switch_bool_t exec_conf_record_start(const cmd_item_t *c, const char *con
 		switch_snprintf(err, errlen, "conference record: bad id or duration");
 		return SWITCH_FALSE; /* malformed: command result only */
 	}
-	if (zstr(c->upload_url) || !sg_safe_url(c->upload_url)) {
+	if (zstr(c->upload_url) || !mf_upload_ok(c->upload_url, globals.upload_hosts)) {
 		switch_snprintf(err, errlen, "conference record: bad upload url");
 		return SWITCH_FALSE;
 	}
@@ -1406,7 +1442,7 @@ static switch_bool_t exec_conf_record_start(const cmd_item_t *c, const char *con
 	}
 	j->deadline_ms = cr_now_ms() + (int64_t) c->max_len_s * 1000;
 	switch_mutex_unlock(globals.rec_mutex);
-	if (switch_dir_make_recursive(dir, SWITCH_DEFAULT_DIR_PERMS, globals.pool) != SWITCH_STATUS_SUCCESS) {
+	if (make_dir(dir) != SWITCH_STATUS_SUCCESS) { /* not globals.pool: it would grow by every recording start */
 		cr_fail_admitted(j, err, errlen, "conference record: cannot create directory");
 		return SWITCH_FALSE;
 	}
@@ -1449,7 +1485,7 @@ static switch_bool_t exec_conf_record_start(const cmd_item_t *c, const char *con
 
 static switch_bool_t exec_conf_record(const cmd_item_t *c, const char *conf, char *err, size_t errlen)
 {
-	if (c->conf_action == 10) return exec_conf_record_stop(c, conf, err, errlen);
+	if (c->conf_action == SG_CONF_RECORD_STOP) return exec_conf_record_stop(c, conf, err, errlen);
 	return exec_conf_record_start(c, conf, err, errlen);
 }
 
@@ -1504,7 +1540,7 @@ static void cr_on_add_member(switch_event_t *event)
 	cr_copy(ucopy, sizeof(ucopy), uuid);
 	cr_copy(icopy, sizeof(icopy), inst ? inst : "");
 	switch_core_session_rwunlock(s);
-	gb_send_conf_event(globals.bridge, 2 /* ROOM_READY */, tcopy, rcopy, "", 0, 0, ucopy, icopy);
+	gb_send_conf_event(globals.bridge, GB_CONF_ROOM_READY, tcopy, rcopy, "", 0, 0, ucopy, icopy);
 }
 
 static void cr_maint_event(switch_event_t *event)
@@ -1722,7 +1758,7 @@ static switch_bool_t inline_record(switch_core_session_t *session, const gb_comm
 		oc->path[0] = 0;
 		return SWITCH_FALSE;
 	}
-	if (!zstr(c->upload_url) && !sg_safe_url(c->upload_url)) {
+	if (!zstr(c->upload_url) && !mf_upload_ok(c->upload_url, globals.upload_hosts)) {
 		switch_snprintf(err, errlen, "record: bad upload url");
 		oc->path[0] = 0;
 		return SWITCH_FALSE;
@@ -1802,7 +1838,7 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 	const char *dial = c->dial_string;
 	switch_bool_t ok = SWITCH_TRUE;
 
-	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_MESSAGE_WAITING) { /* the bridge maps an unknown action to type 0 */
+	if (c->type < GB_CMD_ORIGINATE || c->type > GB_CMD_ANSWER) { /* the bridge maps an unknown action to type 0 */
 		switch_snprintf(err, sizeof(err), "unknown command type %d", c->type);
 		ok = SWITCH_FALSE;
 	} else if (c->type == GB_CMD_CONFERENCE_CONTROL) { /* no channel to check the tenant against: stream commands only */
@@ -1857,6 +1893,12 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 	case GB_CMD_PARK:
 		switch_core_session_execute_application(session, "park", "");
 		break;
+	case GB_CMD_ANSWER: /* already answered: SUCCESS, a no-op */
+		if (switch_channel_answer(channel) != SWITCH_STATUS_SUCCESS) {
+			switch_snprintf(err, sizeof(err), "answer: failed");
+			ok = SWITCH_FALSE;
+		}
+		break;
 	case GB_CMD_PLAYBACK: {
 		char media[1024];
 		const char *play = c->file;
@@ -1866,7 +1908,7 @@ static void run_inline(switch_core_session_t *session, const gb_command_t *c, ou
 				ok = SWITCH_FALSE;
 				break;
 			}
-			if (!media_local(c->url, media, sizeof(media), err, sizeof(err))) {
+			if (!media_local(channel_tenant(channel), c->url, media, sizeof(media), err, sizeof(err))) {
 				ok = SWITCH_FALSE;
 				break;
 			}
@@ -2994,6 +3036,7 @@ static switch_status_t load_impl(switch_loadable_module_interface_t **module_int
 				else globals.data_timeout_ms = t;
 			}
 			else if (!strcasecmp(var, "media-hosts")) globals.media_hosts = switch_core_strdup(pool, val);
+			else if (!strcasecmp(var, "upload-hosts")) globals.upload_hosts = switch_core_strdup(pool, val);
 			else if (!strcasecmp(var, "media-cache-dir")) globals.media_cache_dir = switch_core_strdup(pool, val);
 			else if (!strcasecmp(var, "media-cache-max") || !strcasecmp(var, "media-max-bytes")) {
 				long long n = atoll(val);
@@ -3253,6 +3296,10 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_grpc_shutdown)
 	undrain(); /* after the command thread: no Drain can land behind it; an unloaded module must not leave the node paused */
 	/* Deliberately leave the stopped bridge allocated and globals.bridge set (a small leak per unload): in-flight
 	 * event/route/API users are not waited for, and on a stopped bridge they just get GB_ERR_DISCONNECTED instead of
-	 * touching freed memory or NULL. */
-	return SWITCH_STATUS_SUCCESS;
+	 * touching freed memory or NULL.
+	 * NOUNLOAD keeps the module pool too, for the same users: a plain `unload` refuses while a call is in grpc_route
+	 * ("Module in use"), but `unload -f` does not, and the pool holds globals' strings and state_mutex, which such a
+	 * call keeps reading (report_step can retry for ~24 s). The code stays mapped anyway (-z nodelete).
+	 * ponytail: a `load` right after a forced unload resets globals under such a call; wait for calls to end first. */
+	return SWITCH_STATUS_NOUNLOAD;
 }
